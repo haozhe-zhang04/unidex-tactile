@@ -1,0 +1,12 @@
+__pycache__
+logs
+.idea
+.vscode
+wandb
+debug.py
+ckpt
+.history
+*.png
+isaac-gym-preview-4
+isaacgym
+*.egg-info
