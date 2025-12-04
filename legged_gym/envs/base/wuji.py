@@ -1,11 +1,12 @@
 from .base_config import BaseConfig
 
-class LeggedRobotCfg(BaseConfig):
+class WujiRobotCfg(BaseConfig):
     class env:
-        num_envs = 64
-        num_observations = 48
+        num_envs = 128
+        num_observations = 48 
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
-        num_actions = 12
+        num_actions = 20
+
         env_spacing = 3.  # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
         episode_length_s = 20 # episode length in seconds
@@ -37,12 +38,14 @@ class LeggedRobotCfg(BaseConfig):
         # trimesh only:
         slope_treshold = 0.75 # slopes above this threshold will be corrected to vertical surfaces
 
+    #TODO
     class commands:
         curriculum = False
         max_curriculum = 1.
         num_commands = 4 # default: lin_vel_x, lin_vel_y, ang_vel_yaw, heading (in heading mode ang_vel_yaw is recomputed from heading error)
         resampling_time = 10. # time before command are changed[s]
         heading_command = True # if true: compute ang vel command from heading error
+        finger_tips_forced_prob_cmd = 0.8
         class ranges:
             lin_vel_x = [-1.0, 1.0] # min max [m/s]
             lin_vel_y = [-1.0, 1.0]   # min max [m/s]
@@ -50,17 +53,18 @@ class LeggedRobotCfg(BaseConfig):
             heading = [-3.14, 3.14]
 
     class init_state:
-        pos = [0.0, 0.0, 1.] # x,y,z [m]
-        rot = [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
-        lin_vel = [0.0, 0.0, 0.0]  # x,y,z [m/s]
-        ang_vel = [0.0, 0.0, 0.0]  # x,y,z [rad/s]
-        default_joint_angles = { # target angles when action = 0.0
-            "joint_a": 0., 
-            "joint_b": 0.}
-
+        pos = [0.0]*20
+        # rot = [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
+        # lin_vel = [0.0, 0.0, 0.0]  # x,y,z [m/s]
+        # ang_vel = [0.0, 0.0, 0.0]  # x,y,z [rad/s]
+        # default_joint_angles = { # target angles when action = 0.0
+        #     "joint_a": 0., 
+        #     "joint_b": 0.}
+    
     class control:
         control_type = 'P' # P: position, V: velocity, T: torques
         # PD Drive parameters:
+
         stiffness = {'joint_a': 10.0, 'joint_b': 15.}  # [N*m/rad]
         damping = {'joint_a': 1.0, 'joint_b': 1.5}     # [N*m*s/rad]
         # action scale: target angle = actionScale * action + defaultAngle
@@ -70,13 +74,13 @@ class LeggedRobotCfg(BaseConfig):
 
     class asset:
         file = ""
-        name = "legged_robot"  # actor name
-        foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
-        thigh_name = "None"
+        name = "wuji"  # actor name
+        # foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
+        # thigh_name = "None"
         penalize_contacts_on = []
         terminate_after_contacts_on = []
         disable_gravity = False
-        collapse_fixed_joints = True # merge bodies connected by fixed joints. Specific fixed joints can be kept by adding " <... dont_collapse="true">
+        collapse_fixed_joints = False # merge bodies connected by fixed joints. Specific fixed joints can be kept by adding " <... dont_collapse="true">
         fix_base_link = False # fixe the base of the robot
         default_dof_drive_mode = 3 # see GymDofDriveModeFlags (0 is none, 1 is pos tgt, 2 is vel tgt, 3 effort)
         self_collisions = 0 # 1 to disable, 0 to enable...bitwise filter
@@ -100,6 +104,7 @@ class LeggedRobotCfg(BaseConfig):
         push_interval_s = 15
         max_push_vel_xy = 1.
 
+    #TODO
     class rewards:
         class scales:
             termination = -0.0
@@ -128,21 +133,7 @@ class LeggedRobotCfg(BaseConfig):
 
     class normalization:
         class obs_scales:
-            lin_vel = 2.0
-            ang_vel = 0.25
-            dof_pos = 1.0
-            dof_vel = 0.05
-            height_measurements = 5.0
-            ee_sphe_radius_cmd = 0.5   # 0.2 - 0.7 
-            ee_sphe_pitch_cmd = 1.0    # -1.3 , 1.3 
-            ee_sphe_yaw_cmd = 1.3
-            end_effector_roll_cmd = 0.5
-            end_effector_pitch_cmd = 0.5
-            end_effector_yaw_cmd = 0.5
-            ee_force = 0.01
-            base_force = 0.01
-        clip_observations = 100.
-        clip_actions = 100.
+            pass
 
     class noise:
         add_noise = True
@@ -180,7 +171,7 @@ class LeggedRobotCfg(BaseConfig):
             default_buffer_size_multiplier = 5
             contact_collection = 2 # 0: never, 1: last sub-step, 2: all sub-steps (default=2)
 
-class LeggedRobotCfgPPO(BaseConfig):
+class WujiRobotCfgPPO(BaseConfig):
     seed = 1
     runner_class_name = 'OnPolicyRunner'
     class policy:

@@ -1,0 +1,11 @@
+task_class:   LeggedRobot_b2z1_pos_force, 
+env_cfg:      B2Z1PosForceRoughCfg(), 
+train_cfg:   B2Z1PosForceRoughCfgPPO()
+
+
+
+
+env由task_class创建
+
+
+ Actor 看着 obs 并在脑子里估算 obs_pred（以此感知环境变化），而 Critic 看着 privileged_obs 来告诉 Actor 做得对不对。
