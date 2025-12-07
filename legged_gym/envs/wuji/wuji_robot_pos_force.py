@@ -121,8 +121,8 @@ class WujiRobot_pos_force(BaseTask):
             self.dof_pos_target[:,4:8] = actions[:,4:8] + self.dof_pos[:,4:8]
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
 
-            if self.global_steps > self.cfg.commands.force_start_step * 24:
-                self._push_finger_tip(torch.arange(self.num_envs, device=self.device))
+            # if self.global_steps > self.cfg.commands.force_start_step * 24:
+            self._push_finger_tip(torch.arange(self.num_envs, device=self.device))
 
             self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces[:,:,:3].reshape(-1, 3).contiguous()), None, gymapi.LOCAL_SPACE)
             self.gym.simulate(self.sim)
@@ -210,7 +210,7 @@ class WujiRobot_pos_force(BaseTask):
             self._draw_ee_goal_curr()
         #     self._draw_ee_goal_traj()
         #     self._draw_collision_bbox()
-        #     self._draw_ee_force()
+            self._draw_ee_force()
         #     self._draw_base_force()
         #     self._draw_curve()
 
@@ -356,12 +356,10 @@ class WujiRobot_pos_force(BaseTask):
         forces_cmd_local = self.current_Fxyz_finger_tips_cmd
         forces_offset_local = (forces_local + forces_cmd_local)
 
-        forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1), forces_offset_local)
 
-        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + self.curr_finger_tip_goal_cart
-       
-        # self.get_ee_goal_spherical_center()是获得当前的目标位置
-        ee_goal_offset_local_cart = quat_rotate_inverse(self.base_quat, curr_ee_goal_cart_world_offset)
+        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
+        curr_ee_goal_cart_base = quat_rotate_inverse(self.base_quat,curr_ee_goal_cart_world_offset)
 
         # self.privileged_obs_buf = torch.cat((
         #                             self.base_lin_vel * self.obs_scales.lin_vel, # 3
@@ -397,20 +395,27 @@ class WujiRobot_pos_force(BaseTask):
         #                             self.forces_local[:, self.gripper_idx] * self.obs_scales.ee_force, # 3
         #                             self.forces_local[:, self.robot_base_idx] * self.obs_scales.base_force, # 3
         #                             ),dim=-1)
+        sensor_forces_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1),self.sensors_forces[:,0,:3].squeeze(1))
+        sensor_forces_base = quat_rotate_inverse(self.base_quat,sensor_forces_world)
 
-        self.privileged_obs_buf = torch.cat((self.sensors_forces.squeeze(1),# 6
+        F_cmd_local = self.commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]
+        F_cmd_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1),F_cmd_local)
+        F_cmd_base = quat_rotate_inverse(self.base_quat,F_cmd_world)
+        commands = self.commands.clone()
+        commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)] = F_cmd_base
+
+        self.privileged_obs_buf = torch.cat((sensor_forces_base,# 3
                                 self.dof_pos[:,4:8],#4
-                                self.commands, # 3+6
-                                ee_goal_offset_local_cart,
+                                commands, # 3+6
                             ),dim=-1)
         obs_pred = torch.cat((
-                                self.sensors_forces.squeeze(1),# 6
+                                sensor_forces_base,# 3
                                 self.dof_pos[:,4:8],#4
-                                self.commands, # 3+6
+                                commands, # 3+6
                             ),dim=-1)
-        obs_buf = torch.cat(( self.sensors_forces.squeeze(1),# 6
+        obs_buf = torch.cat(( sensor_forces_base,# 3
                                 self.dof_pos[:,4:8],#4
-                                self.commands, # 3+6
+                                commands, # 3+6
                             ),dim=-1)
    
         # add perceptive inputs if not blind
@@ -556,7 +561,7 @@ class WujiRobot_pos_force(BaseTask):
 
         sphere_geom_4 = gymutil.WireframeSphereGeometry(0.001, 4, 4, None, color=(1, 0, 1)) # 紫
 
-        sphere_geom_2 = gymutil.WireframeSphereGeometry(0.001, 4, 4, None, color=(0, 0, 1)) # 蓝
+        sphere_geom_2 = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(0, 0, 1)) # 蓝
         ee_pose = self.rigid_state[:, self.finger_tips_idx, :3]
 
         sphere_geom_origin = gymutil.WireframeSphereGeometry(0.001, 8, 8, None, color=(0, 1, 0)) # 绿
@@ -574,27 +579,26 @@ class WujiRobot_pos_force(BaseTask):
 
         forces_local = self.sensors_forces[:, 0, :3]
         forces_cmd_local = self.current_Fxyz_finger_tips_cmd
-        forces_offset_local = (forces_local + forces_cmd_local)
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1), forces_local + forces_cmd_local)
+        curr_finger_tip_goal_cart_global = quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
 
-     
-        forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
+        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + curr_finger_tip_goal_cart_global
 
-        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + self.curr_finger_tip_goal_cart
 
         for i in range(self.num_envs):
-            sphere_pose = gymapi.Transform(gymapi.Vec3(self.curr_finger_tip_goal_cart[i, 0], self.curr_finger_tip_goal_cart[i, 1], self.curr_finger_tip_goal_cart[i, 2]), r=None)
-            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            sphere_pose = gymapi.Transform(gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], curr_finger_tip_goal_cart_global[i, 1], curr_finger_tip_goal_cart_global[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)  # 黄
 
-            sphere_pose_4 = gymapi.Transform(gymapi.Vec3(curr_ee_goal_cart_world_offset[i, 0], curr_ee_goal_cart_world_offset[i, 1], curr_ee_goal_cart_world_offset[i, 2]), r=None)
-            gymutil.draw_lines(sphere_geom_4, self.gym, self.viewer, self.envs[i], sphere_pose_4) 
+            sphere_pose_4 = gymapi.Transform(gymapi.Vec3(curr_ee_goal_cart_world_offset[i, 0].item(), curr_ee_goal_cart_world_offset[i, 1].item(), curr_ee_goal_cart_world_offset[i, 2].item()), r=None)
+            gymutil.draw_lines(sphere_geom_4, self.gym, self.viewer, self.envs[i], sphere_pose_4) #紫
             
-            sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i,0, 0], ee_pose[i,0, 1], ee_pose[i,0, 2]), r=None)
-            gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) 
+            # sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i,0, 0].item(), ee_pose[i,0, 1].item(), ee_pose[i,0, 2].item()), r=None)
+            # gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) #蓝
 
             # sphere_pose_3 = gymapi.Transform(gymapi.Vec3(upper_arm_pose[i, 0], upper_arm_pose[i, 1], upper_arm_pose[i, 2]), r=None)
             # gymutil.draw_lines(sphere_geom_3, self.gym, self.viewer, self.envs[i], sphere_pose_3) 
 
-            pose = gymapi.Transform(gymapi.Vec3(self.curr_finger_tip_goal_cart[i, 0], self.curr_finger_tip_goal_cart[i, 1], self.curr_finger_tip_goal_cart[i, 2]), 
+            pose = gymapi.Transform(gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], curr_finger_tip_goal_cart_global[i, 1], curr_finger_tip_goal_cart_global[i, 2]), 
                                     )
             gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
 
@@ -603,34 +607,39 @@ class WujiRobot_pos_force(BaseTask):
         """ Draws visualizations for dubugging (slows down simulation a lot).
             Default behaviour: draws height measurement points
         """
-        sphere_geom_arrow_1 = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 0, 1))
+        sphere_geom_arrow_1 = gymutil.WireframeSphereGeometry(0.001, 16, 16, None, color=(0, 0, 1))
         arrow_color_1 = [0, 0, 1]
-        sphere_geom_arrow_2 = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 1, 0))
+        sphere_geom_arrow_2 = gymutil.WireframeSphereGeometry(0.001, 16, 16, None, color=(0, 1, 0))
         arrow_color_2 = [0, 1, 0]
-        ee_pose = self.rigid_state[:, self.gripper_idx, :3]
-        forces_global = self.forces[:, self.gripper_idx, 0:3] / 100
-        forces_global_norm = torch.norm(forces_global, dim=-1, keepdim=True)
-        target_forces_global = forces_global / (forces_global_norm + 1e-5)
-        forces_cmd = self.current_Fxyz_gripper_cmd / 100
-        forces_cmd_global = quat_apply(self.base_yaw_quat, forces_cmd)
-        forces_cmd_norm = torch.norm(forces_cmd_global, dim=-1, keepdim=True)
-        target_forces_cmd = forces_cmd_global / (forces_cmd_norm + 1e-5)
+        
+        sensor_forces = self.sensors_forces[:,0,:3].clone()
+        sensor_forces_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1),sensor_forces)
+        sensor_forces_norm = torch.norm(sensor_forces,dim=-1,keepdim=True)
+
+        ext_forces = self.forces[:,self.finger_tips_idx,:3].clone().squeeze(1)
+        ext_forces_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1),ext_forces)
+        ext_forces_norm = torch.norm(ext_forces,dim=-1,keepdim=True)
+        print("sensor_forces:",sensor_forces_norm)
+        print("ext_forces:",ext_forces_norm)
+        print("F_cmd", self.current_Fxyz_finger_tips_cmd)
+        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3].squeeze(1)
+
         for i in range(self.num_envs):
 
-            start_pos = ee_pose[i].cpu().numpy()
-            arrow_direction = target_forces_global[i].cpu().numpy()
-            arrow_length = forces_global_norm[i].item()
-            end_pos = start_pos + arrow_direction * arrow_length
-            verts = [start_pos, end_pos]
-            colors = [arrow_color_1, arrow_color_1]
-            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
-            head_pos = end_pos
-            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
-            gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
+            # start_pos = ee_pose[i].cpu().numpy()
+            # arrow_direction = sensor_forces_global[i].cpu().numpy()
+            # arrow_length = sensor_forces_norm[i].item() * 10
+            # end_pos = start_pos + arrow_direction * arrow_length
 
+            # verts = [start_pos, end_pos]
+            # colors = [arrow_color_1, arrow_color_1]
+            # self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            # head_pos = end_pos
+            # head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            # gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
             start_pos = ee_pose[i].cpu().numpy()
-            arrow_direction = target_forces_cmd[i].cpu().numpy()
-            arrow_length = forces_cmd_norm[i].item()
+            arrow_direction = ext_forces_global[i].cpu().numpy()
+            arrow_length = ext_forces_norm[i].item() * 10
             end_pos = start_pos + arrow_direction * arrow_length
             verts = [start_pos, end_pos]
             colors = [arrow_color_2, arrow_color_2]
@@ -835,6 +844,23 @@ class WujiRobot_pos_force(BaseTask):
                 r = self.dof_pos_limits[i, 1] - self.dof_pos_limits[i, 0]
                 self.dof_pos_limits[i, 0] = m - 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
                 self.dof_pos_limits[i, 1] = m + 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
+             # ⭐ 关键修复：为灵巧手关节（索引4:8）设置位置控制模式和PD参数
+            for i in range(len(props)):
+                if i >= 4 and i < 8:  # 灵巧手关节
+                    props["driveMode"][i] = gymapi.DOF_MODE_POS  # 位置控制模式
+                    # 从配置中获取 stiffness 和 damping
+                    name = self.dof_names[i]
+                    found = False
+                    for dof_name in self.cfg.control.stiffness.keys():
+                        if dof_name in name:
+                            props["stiffness"][i] = self.cfg.control.stiffness[dof_name]
+                            props["damping"][i] = self.cfg.control.damping[dof_name]
+                            found = True
+                            break
+                    if not found:
+                        # 使用默认值
+                        props["stiffness"][i] = 64.0
+                        props["damping"][i] = 1.5
         return props
 
     def _randomize_dof_props(self, env_ids):
@@ -953,12 +979,12 @@ class WujiRobot_pos_force(BaseTask):
         self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
 
     def _resample_ee_goal(self, env_ids, is_init=False):
-        if self.cfg.env.teleop_mode and is_init:
-            self.curr_ee_goal_sphere[:] = self.init_start_ee_sphere[:]
-            self.commands[:, INDEX_EE_POS_RADIUS_CMD:(INDEX_EE_POS_YAW_CMD+1)] = self.curr_ee_goal_sphere.view(self.num_envs,3)
-            return
-        elif self.cfg.env.teleop_mode:
-            return
+        # if self.cfg.env.teleop_mode and is_init:
+        #     self.curr_ee_goal_sphere[:] = self.init_start_ee_sphere[:]
+        #     self.commands[:, INDEX_EE_POS_RADIUS_CMD:(INDEX_EE_POS_YAW_CMD+1)] = self.curr_ee_goal_sphere.view(self.num_envs,3)
+        #     return
+        # elif self.cfg.env.teleop_mode:
+        #     return
 
         if len(env_ids) > 0:
             init_env_ids = env_ids.clone()
@@ -974,8 +1000,8 @@ class WujiRobot_pos_force(BaseTask):
                     self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
                     self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
                 else:
-                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
-                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    # self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    self.finger_tip_goal_cart[env_ids] = quat_rotate_inverse(self.base_quat[env_ids],self.rigid_state[env_ids,self.finger_tips_idx,:3].clone().squeeze(1)) - self.base_pos[env_ids]
             else:
                 if self.global_steps < 0 * 24 and not self.play:
                     self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
@@ -1091,8 +1117,10 @@ class WujiRobot_pos_force(BaseTask):
                 max_force_cmd = self.cfg.commands.max_push_force_xyz_finger_tips_cmd[1]
 
                 self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 0] = torch_rand_float(min_force_cmd, max_force_cmd, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
-                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 1] = torch_rand_float(min_force_cmd, max_force_cmd, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
-                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 2] = torch_rand_float(min_force_cmd, max_force_cmd, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                # self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 1] = torch_rand_float(min_force_cmd, max_force_cmd, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                # self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 2] = torch_rand_float(min_force_cmd, max_force_cmd, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 1] =0
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 2] =0
 
                 push_duration_finger_tips_cmd = torch_rand_float(self.push_duration_finger_tips_cmd_min, self.push_duration_finger_tips_cmd_max, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd)) # 4.0/self.dt
                 push_duration_finger_tips_cmd = torch.clip(push_duration_finger_tips_cmd, max=(self.push_interval_finger_tips_cmd[new_selected_env_ids_cmd, 0] - self.settling_time_force_finger_tips)/2).to(self.device)
@@ -1163,8 +1191,12 @@ class WujiRobot_pos_force(BaseTask):
                 max_force_ext = self.cfg.commands.max_push_force_xyz_finger_tips_ext[1]
 
                 self.force_target_finger_tips_ext[new_selected_env_ids_ext, 0] = torch_rand_float(min_force_ext, max_force_ext, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
-                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 1] = torch_rand_float(min_force_ext, max_force_ext, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
-                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 2] = torch_rand_float(min_force_ext, max_force_ext, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+                # self.force_target_finger_tips_ext[new_selected_env_ids_ext, 1] = torch_rand_float(min_force_ext, max_force_ext, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+                # self.force_target_finger_tips_ext[new_selected_env_ids_ext, 2] = torch_rand_float(min_force_ext, max_force_ext, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 1] =0
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 2] =0
+
+                
                 push_duration_finger_tips_ext = torch_rand_float(self.push_duration_finger_tips_ext_min, self.push_duration_finger_tips_ext_max, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext)) # 4.0/self.dt
                 push_duration_finger_tips_ext = torch.clip(push_duration_finger_tips_ext, max=(self.push_interval_finger_tips_ext[new_selected_env_ids_ext, 0] - self.settling_time_force_finger_tips)/2).to(self.device)
                 self.push_end_time_finger_tips_ext[new_selected_env_ids_ext] = self.episode_length_buf[new_selected_env_ids_ext] + push_duration_finger_tips_ext
@@ -1595,6 +1627,7 @@ class WujiRobot_pos_force(BaseTask):
             env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             start_pose = gymapi.Transform()
             start_pose.p = gymapi.Vec3(self.env_origins[i, 0], self.env_origins[i, 1], self.env_origins[i, 2])
+
             rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
             self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
             actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, self.cfg.asset.name, i, self.cfg.asset.self_collisions, 0)
@@ -1796,10 +1829,11 @@ class WujiRobot_pos_force(BaseTask):
         forces_cmd_local = self.current_Fxyz_finger_tips_cmd
         forces_offset_local = (forces_local + forces_cmd_local)
 
-     
-        forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1), forces_offset_local)
+        # forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
 
-        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + self.curr_finger_tip_goal_cart
+        curr_finger_tip_goal_cart_global = quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
+        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + curr_finger_tip_goal_cart_global
        
         ee_pos_error = torch.sum(torch.abs(self.finger_tips_pos.squeeze(1) - curr_ee_goal_cart_world_offset), dim=1)
         rew = torch.exp(-ee_pos_error/self.cfg.rewards.tracking_ee_sigma * 2)

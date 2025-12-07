@@ -99,11 +99,11 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         num_joints = 20
         frame_stack = 32
         c_frame_stack = 3
-        num_single_obs = 19
+        num_single_obs = 16  # 19: 6(sensors) + 4(dof_pos) + 9(commands)
 
-        num_pred_obs = 19
-        num_observations = int(frame_stack * num_single_obs)
-        single_num_privileged_obs = 22
+        num_pred_obs = 16
+        num_observations = int(frame_stack * num_single_obs)  # 32 * 22 = 704
+        single_num_privileged_obs = 16
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
 
         observe_gait_commands = False
@@ -122,9 +122,9 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             x_cmd_x = [-0.1, 0.1] # min max [m/s]
             x_cmd_y = [-0.1, 0.1]   # min max
             x_cmd_z = [-0.1, 0.1]    # min max [rad/s]
-            F_cmd_x = [-15.0, 15.0] # min max [N]
-            F_cmd_y = [-15.0, 15.0]   # min max
-            F_cmd_z = [-15.0, 15.0]    # min max
+            # F_cmd_x = [-15.0, 15.0] # min max [N]
+            # F_cmd_y = [-15.0, 15.0]   # min max
+            # F_cmd_z = [-15.0, 15.0]    # min max
             
         randomize_gripper_force_gains = True
         gripper_force_kp_range = [200., 200.]
@@ -137,12 +137,12 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         push_tip_duration_s_ext = [1.0, 3.0]
         finger_tips_forced_prob_ext = 0.8
 
-        max_push_force_xyz_finger_tips_cmd = [-5, 5] # [N]
-        max_push_force_xyz_finger_tips_ext = [-5, 5] # [N]
+        max_push_force_xyz_finger_tips_cmd = [0, 5] # [N]
+        max_push_force_xyz_finger_tips_ext = [-5, 0] # [N]
 
         settling_time_force_finger_tips_s = 1.0
 
-        force_start_step = 8000
+        force_start_step = 1000
     class terrain:
         mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
         hf2mesh_method = "fast"  # grid or fast
@@ -252,14 +252,14 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             # feet_air_time = 1.0 
             # feet_height = 1.0 
             # ang_vel_xy = -0.02 
-        #dof_acc = -2.5e-7 
-        #dof_vel = -8.e-4
+            dof_acc = -2.5e-7 
+            dof_vel = -8.e-4
             # dof_acc_arm = -4.5e-7 
             # dof_vel_arm = -2.e-4
             # collision = -5. 
-        #action_rate = -0.02 
+            action_rate = -0.02 
             # action_rate_arm = -0.045 
-        #dof_pos_limits = -10.0 
+            dof_pos_limits = -10.0 
             # torque_limits = -0.005
             # hip_pos = -0.5  
             # feet_drag = -0.0008 
