@@ -20,17 +20,10 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             z_invariant_offset = 0.8 # Relative to terrain
         
         class ranges:
-            init_pos_start = [0.66, np.pi/4, 0]
+            init_pos_start = [0, 0, 0]
             # init_pos_end = [0.66, np.pi/6, 0]
             # init_pos_end = [0.66, -1 * np.pi / 3, 0]
-            init_pos_end = [0.66, 0, 0]
-            pos_l = [0.35, 0.95]
-            pos_p = [-2 * np.pi / 5, 2 * np.pi / 5]
-            pos_y = [-3 * np.pi/ 5, 3 * np.pi /5]
-
-            delta_orn_r = [-0.5, 0.5]
-            delta_orn_p = [-0.5, 0.5]
-            delta_orn_y = [-0.5, 0.5]
+            init_pos_end = [0, 0, 0]
             
         sphere_error_scale = [1, 1, 1]#[1 / (ranges.final_pos_l[1] - ranges.final_pos_l[0]), 1 / (ranges.final_pos_p[1] - ranges.final_pos_p[0]), 1 / (ranges.final_pos_y[1] - ranges.final_pos_y[0])]
         orn_error_scale = [1, 1, 1]#[2 / np.pi, 2 / np.pi, 2 / np.pi]
@@ -38,7 +31,31 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
     class init_state( WujiRobotCfg.init_state ):
 
         default_joint_pos = [0.0]* 4
-        
+        default_joint_angles = { # = target angles [rad] when action = 0.0
+            'FL_hip_joint': 0.15,   # [rad]
+            'FL_thigh_joint': 0.67,     # [rad]
+            'FL_calf_joint': -1.32,   # [rad]
+
+            'RL_hip_joint': 0.15,   # [rad]
+            'RL_thigh_joint': 0.67,   # [rad]
+            'RL_calf_joint': -1.32,    # [rad]
+
+            'FR_hip_joint': -0.15,  # [rad]
+            'FR_thigh_joint': 0.67,     # [rad]
+            'FR_calf_joint': -1.32,  # [rad]
+
+            'RR_hip_joint': -0.15,   # [rad]
+            'RR_thigh_joint': 0.67,   # [rad]
+            'RR_calf_joint': -1.32,    # [rad]
+
+            'z1_waist': 0.0,
+            'z1_shoulder': 1.48,
+            'z1_elbow': -1.5, # -0.63,
+            'z1_wrist_angle': 0, # -0.84,
+            'z1_forearm_roll': 0.0,
+            'z1_wrist_rotate': 1.57, # 0.0,
+            'z1_jointGripper': -0.785,
+        }
         rand_yaw_range = np.pi/2
         origin_perturb_range = 0.5
         init_vel_perturb_range = 0.1
@@ -78,15 +95,15 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
 
 
     class env( WujiRobotCfg.env ):
-        num_actions = 4
-        num_joints = 4
+        num_actions = 20
+        num_joints = 20
         frame_stack = 32
         c_frame_stack = 3
-        num_single_obs = 13
+        num_single_obs = 19
 
-        num_pred_obs = 12
+        num_pred_obs = 19
         num_observations = int(frame_stack * num_single_obs)
-        single_num_privileged_obs = 149
+        single_num_privileged_obs = 22
         num_privileged_obs = int(c_frame_stack * single_num_privileged_obs)
 
         observe_gait_commands = False
@@ -98,7 +115,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
     class commands:
         curriculum = False
         max_curriculum = 1.
-        num_commands = 2 # default: lin_vel_x, lin_vel_y, ang_vel_yaw (in heading mode ang_vel_yaw is recomputed from heading error)
+        num_commands = 9 # default: F_cmd(6) + X_cmd(3)
         resampling_time = 5. # time before command are changed[s]
         heading_command = False # if true: compute ang vel command from heading error
         class ranges:
@@ -108,12 +125,11 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             F_cmd_x = [-15.0, 15.0] # min max [N]
             F_cmd_y = [-15.0, 15.0]   # min max
             F_cmd_z = [-15.0, 15.0]    # min max
-            F_ext_x = [-10.0, 10.0] # min max [N]
-            F_ext_y = [-10.0, 10.0]   # min max
-            F_ext_z = [-10.0, 10.0]    # min max
-   
+            
+        randomize_gripper_force_gains = True
+        gripper_force_kp_range = [200., 200.]
         # Push tip
-        push_tip = True
+        push_finger_tips = True
         push_tip_interval_s_cmd = [3.5, 9.0]
         push_tip_duration_s_cmd = [1.0, 3.0]
         finger_tips_forced_prob_cmd = 0.8
@@ -125,9 +141,6 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         max_push_force_xyz_finger_tips_ext = [-5, 5] # [N]
 
         settling_time_force_finger_tips_s = 1.0
-        force_z_base_ext_scale = 0.1
-
-        settling_time_force_base_s = 3.0
 
         force_start_step = 8000
     class terrain:
@@ -205,9 +218,9 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
     
     #TODO
     class rewards( WujiRobotCfg.rewards ):
-        gait_vel_sigma = 2.0
-        gait_force_sigma = 2.0
-        kappa_gait_probs = 0.07
+        # gait_vel_sigma = 2.0
+        # gait_force_sigma = 2.0
+        # kappa_gait_probs = 0.07
 
         only_positive_rewards = False # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
@@ -215,56 +228,57 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         soft_dof_pos_limit = 0.8 # percentage of urdf limits, values above this limit are penalized
         soft_dof_vel_limit = 1.
         soft_torque_limit = 0.9
-        base_height_target = 0.50
-        max_contact_force = 200. # forces above this value are penalized
+        # base_height_target = 0.50
+        # max_contact_force = 200. # forces above this value are penalized
 
         cycle_time = 0.64
-        target_joint_pos_scale = 0.17
-        target_joint_pos_thd = 0.5
+        # target_joint_pos_scale = 0.17
+        # target_joint_pos_thd = 0.5
 
-        sigma_force = 1/50
+        # sigma_force = 1/50
         
         class scales:
 
-            feet_contact_number = 2.0
+            # feet_contact_number = 2.0
 
-            tracking_lin_vel_force_world = 2.0
-            tracking_ang_vel = 1.0 
+            # tracking_lin_vel_force_world = 2.0
+            # tracking_ang_vel = 1.0 
 
-            torques = -5.e-6 
-            stand_still = 0.5 
-            ref_dof_leg = 1.0
-            alive = 1.5
-            lin_vel_z = -1.5 
-            feet_air_time = 1.0 
-            feet_height = 1.0 
-            ang_vel_xy = -0.02 
-            dof_acc = -2.5e-7 
-            dof_vel = -8.e-4
-            dof_acc_arm = -4.5e-7 
-            dof_vel_arm = -2.e-4
-            collision = -5. 
-            action_rate = -0.02 
-            action_rate_arm = -0.045 
-            dof_pos_limits = -10.0 
-            torque_limits = -0.005
-            hip_pos = -0.5  
-            feet_drag = -0.0008 
-            feet_contact_forces = -0.001 
-            base_height = -2.0
-            feet_pos_xy = -0.5
-            feet_height_high = -15
+            # torques = -5.e-6 
+            # stand_still = 0.5 
+            # ref_dof_leg = 1.0
+            # alive = 1.5
+            # lin_vel_z = -1.5 
+            # feet_air_time = 1.0 
+            # feet_height = 1.0 
+            # ang_vel_xy = -0.02 
+        #dof_acc = -2.5e-7 
+        #dof_vel = -8.e-4
+            # dof_acc_arm = -4.5e-7 
+            # dof_vel_arm = -2.e-4
+            # collision = -5. 
+        #action_rate = -0.02 
+            # action_rate_arm = -0.045 
+        #dof_pos_limits = -10.0 
+            # torque_limits = -0.005
+            # hip_pos = -0.5  
+            # feet_drag = -0.0008 
+            # feet_contact_forces = -0.001 
+            # base_height = -2.0
+            # feet_pos_xy = -0.5
+            # feet_height_high = -15
             
-            arm_termination = 0.
-            tracking_ee_sphere = 0.
+            # arm_termination = 0.
+            # tracking_ee_sphere = 0.
+            # tracking_ee_world = 2.0
             tracking_ee_force_world = 2.0
-            tracking_ee_sphere_walking = 0.0
-            tracking_ee_sphere_standing = 0.0
-            tracking_ee_cart = 0.
-            arm_orientation = 0.
-            arm_energy_abs_sum = 0.
-            tracking_ee_orn = 0.
-            tracking_ee_orn_ry = 0.
+            # tracking_ee_sphere_walking = 0.0
+            # tracking_ee_sphere_standing = 0.0
+            # tracking_ee_cart = 0.
+            # arm_orientation = 0.
+            # arm_energy_abs_sum = 0.
+            # tracking_ee_orn = 0.
+            # tracking_ee_orn_ry = 0.
 
 class WujiPosForceRoughCfgPPO( WujiRobotCfgPPO ):
     class algorithm( WujiRobotCfgPPO.algorithm ):

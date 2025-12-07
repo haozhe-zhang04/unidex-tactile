@@ -134,6 +134,8 @@ class WujiRobotCfg(BaseConfig):
     class normalization:
         class obs_scales:
             pass
+        clip_observations = 100.
+        clip_actions = 100.
 
     class noise:
         add_noise = True
