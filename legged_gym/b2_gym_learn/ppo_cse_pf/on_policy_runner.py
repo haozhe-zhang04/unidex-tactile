@@ -121,7 +121,7 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, privileged_obs, obs_pred)
                     with torch.no_grad():
                         latent = self.alg.actor_critic.get_student_latent(obs)
-                    obs_dict, rewards, dones, infos = self.env.step(actions)
+                    obs_dict, rewards, dones, infos,reward_logs = self.env.step(actions)
                     obs, privileged_obs, obs_pred = obs_dict["obs"], obs_dict["privileged_obs"], obs_dict[
                         "obs_pred"]
 
@@ -178,10 +178,14 @@ class OnPolicyRunner:
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 self.writer.add_scalar('Episode/' + key, value, locs['it'])
+                # Log reward components separately for easier wandb inspection (wandb syncs TB)
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
+        reward_logs = locs.get('reward_logs', {}) or {}
+        for r_key, r_val in reward_logs.items():
+            self.writer.add_scalar('Reward/' + r_key, r_val.mean().item(), locs['it'])
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/mean_surrogate_loss', locs['mean_surrogate_loss'], locs['it'])

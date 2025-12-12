@@ -185,3 +185,5 @@ forces_offset_global = quat_apply(finger_tip_quat, forces_offset_local)
 | `rigid_body_state` | **世界坐标系** | 所有刚体的绝对位置和姿态 |
 | `root_states` | **世界坐标系** | Actor根节点的绝对位置和姿态 |
 
+
+

@@ -333,39 +333,29 @@ class LeggedRobot_b2z1_pos_force(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-        # 获得机器人运动的相位
+
         phase = self._get_phase()
-        # 计算机器人腿的参考位置（理想的情况）
         self.compute_ref_state()
 
         sin_pos = torch.sin(2 * torch.pi * phase).unsqueeze(1)
         cos_pos = torch.cos(2 * torch.pi * phase).unsqueeze(1)
 
-        # 判断 四条腿是否着地
-        stance_mask = self._get_gait_phase()
 
-        # 判断 四条腿的接触力是否大于5N
+        stance_mask = self._get_gait_phase()
         contact_mask = self.contact_forces[:, self.feet_indices, 2] > 5.
 
-        # pos的差距
         diff = self.dof_pos[:, :12] - self.ref_dof_pos
 
-        # 机械臂基座在世界坐标系中的位置
         arm_base_pos = self.base_pos + quat_apply(self.base_yaw_quat, self.arm_base_offset)
-
-        # 机械臂末端目标位置在基座局部坐标系中的表示
         ee_goal_local_cart = quat_rotate_inverse(self.base_quat, self.curr_ee_goal_cart_world - arm_base_pos)
-        
-        # 机械臂末端相对于目标球心的位置向量在基座局部坐标系中的表示
+
         ee_local_cart = quat_rotate_inverse(self.base_yaw_quat, self.ee_pos - self.get_ee_goal_spherical_center())
         # Spherical to cartesian coordinates in the arm base frame 
-        # 将机械臂末端的当前位置从笛卡尔坐标系转换为球坐标系（半径、俯仰角、偏航角）
         radius = torch.norm(ee_local_cart, dim=1).view(self.num_envs,1)
         pitch = torch.asin(ee_local_cart[:,2].view(self.num_envs,1)/radius).view(self.num_envs,1)
         yaw = torch.atan2(ee_local_cart[:,1].view(self.num_envs,1), ee_local_cart[:,0].view(self.num_envs,1)).view(self.num_envs,1)
         self.ee_pos_sphe_arm = torch.cat((radius, pitch, yaw), dim=1).view(self.num_envs,3)
         
-        # 将机械臂和基座的受力从全局坐标系转换到局部坐标系。
         base_quat_world = self.base_quat.view(self.num_envs,4)
         base_rpy_world = torch.stack(get_euler_xyz(base_quat_world), dim=1)
         base_quat_world_indep = quat_from_euler_xyz(0 * base_rpy_world[:, 0], 0 * base_rpy_world[:, 1], base_rpy_world[:, 2])
@@ -376,14 +366,13 @@ class LeggedRobot_b2z1_pos_force(BaseTask):
         self.forces_local[:, self.robot_base_idx] = quat_rotate_inverse(base_quat_world_indep, forces_global_base).view(self.num_envs, 3)
         
 
-        # offset very important
+        # offset
+
         forces_global = self.forces[:, self.gripper_idx, 0:3]
         forces_cmd = self.current_Fxyz_gripper_cmd
         forces_cmd_global = quat_apply(self.base_yaw_quat, forces_cmd)
         forces_offset = (forces_global + forces_cmd_global)
         curr_ee_goal_cart_world_offset = forces_offset / self.gripper_force_kps + self.curr_ee_goal_cart_world
-
-        # self.get_ee_goal_spherical_center()是获得当前的目标位置
         ee_goal_offset_local_cart = quat_rotate_inverse(self.base_yaw_quat, curr_ee_goal_cart_world_offset - self.get_ee_goal_spherical_center())
         ee_goal_offset_local_sphere = cart2sphere(ee_goal_offset_local_cart)
 
@@ -422,16 +411,16 @@ class LeggedRobot_b2z1_pos_force(BaseTask):
                                     self.forces_local[:, self.robot_base_idx] * self.obs_scales.base_force, # 3
                                     ),dim=-1)
         
-        obs_buf = torch.cat(( self.get_body_orientation(),  # dim 2
-                                    self.base_ang_vel * self.obs_scales.ang_vel,  # dim 3
+        obs_buf = torch.cat(( #self.get_body_orientation(),  # dim 2
+                                    #self.base_ang_vel * self.obs_scales.ang_vel,  # dim 3
                                     ((self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos)[:, :-self.cfg.env.num_gripper_joints], # dim 17
                                     (self.dof_vel * self.obs_scales.dof_vel)[:, :-self.cfg.env.num_gripper_joints], # dim 17
                                     self.actions[:, :17], # dim 17
-                                    sin_pos, # 1
-                                    cos_pos, # 1
+                                    #sin_pos, # 1
+                                    #cos_pos, # 1
                                     (self.commands * self.commands_scale)[:, :15], # dim 15
                                     ),dim=-1)
-   
+        
         # add perceptive inputs if not blind
         # add noise if needed
         if self.add_noise:  

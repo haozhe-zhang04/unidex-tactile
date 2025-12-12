@@ -2,8 +2,8 @@ from .base_config import BaseConfig
 
 class WujiRobotCfg(BaseConfig):
     class env:
-        num_envs = 128
-        num_observations = 48 
+        num_envs = 512
+        num_observations = 36
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         num_actions = 20
 
@@ -62,13 +62,13 @@ class WujiRobotCfg(BaseConfig):
         #     "joint_b": 0.}
     
     class control:
+        use_delta_action = False  # 改为False，使用绝对目标
+        action_scale = 1.0         # 减小action scale，提高精度
         control_type = 'P' # P: position, V: velocity, T: torques
         # PD Drive parameters:
 
         stiffness = {'joint_a': 10.0, 'joint_b': 15.}  # [N*m/rad]
         damping = {'joint_a': 1.0, 'joint_b': 1.5}     # [N*m*s/rad]
-        # action scale: target angle = actionScale * action + defaultAngle
-        action_scale = 0.5
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
 
@@ -133,9 +133,31 @@ class WujiRobotCfg(BaseConfig):
 
     class normalization:
         class obs_scales:
-            pass
-        clip_observations = 100.
-        clip_actions = 100.
+            dof_pos = 1.0
+            dof_vel = 0.05
+            # 食指x : 0～0.096
+            # 食指y : -0.03664682～0.05499584
+            # 食指z : 0.03804432-0.19527645
+            # x_norm = 2 * (x - min) / (max - min) - 1
+            finger_tip_pos_x_min = 0.0
+            finger_tip_pos_x_max = 0.096
+            finger_tip_pos_y_min = -0.03664682
+            finger_tip_pos_y_max = 0.05499584
+            finger_tip_pos_z_min = 0.03804432
+            finger_tip_pos_z_max = 0.19527645
+
+            sensor_force = 0.1
+            pose_error = 5.0
+            orn_error = 2.0
+            force_error = 0.1
+
+            force_cmd = 0.1
+            orientation_cmd = 1.0
+
+            finger_tip_vel = 5.0
+
+        clip_observations = 1.0
+        clip_actions = 1.0
 
     class noise:
         add_noise = True
@@ -188,9 +210,9 @@ class WujiRobotCfgPPO(BaseConfig):
         
     class algorithm:
         # training params
-        value_loss_coef = 1.0
+        value_loss_coef = 2.0
         use_clipped_value_loss = True
-        clip_param = 0.2
+        clip_param = 0.15 # 0.2
         entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4 # mini batch size = num_envs*nsteps / nminibatches

@@ -50,9 +50,25 @@ class PPO:
         self.adaptation_weights = self.actor_critic.adaptation_weights
         
         self.storage = None # initialized later
-        self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
-        self.adaptation_module_optimizer = optim.Adam(self.actor_critic.parameters(),
-                                                      lr=Adaptation_Args.adaptation_module_learning_rate)
+        # self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
+        # self.adaptation_module_optimizer = optim.Adam(self.actor_critic.parameters(),
+        #                                               lr=Adaptation_Args.adaptation_module_learning_rate)
+
+        # 在 PPO __init__ 中修改：
+
+        # 1. 分离参数
+        adaptation_params = list(self.actor_critic.adaptation_encoder_module.parameters()) + \
+                            list(self.actor_critic.adaptation_decoder_module.parameters())
+
+        # 2. 剩余的参数归为 PPO (Actor + Critic)
+        # 注意：这里需要通过集合操作或遍历来确保不包含 adaptation_params
+        adaptation_ids = list(map(id, adaptation_params))
+        ppo_params = [p for p in self.actor_critic.parameters() if id(p) not in adaptation_ids]
+
+        # 3. 定义优化器
+        self.optimizer = optim.Adam(ppo_params, lr=learning_rate)
+        self.adaptation_module_optimizer = optim.Adam(adaptation_params, 
+                                                    lr=Adaptation_Args.adaptation_module_learning_rate)
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters

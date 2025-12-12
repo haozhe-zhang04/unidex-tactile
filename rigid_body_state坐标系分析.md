@@ -150,3 +150,5 @@ finger_tip_env_local = finger_tip_world - self.env_origins
 | `pinocchio oMf.translation` | 基座坐标系 | 相对于机器人基座的局部位置 |
 | `env_origins` | 世界坐标系 | 每个环境在世界坐标系中的原点位置 |
 
+
+
