@@ -139,12 +139,12 @@ class WujiRobotCfg(BaseConfig):
             # 食指y : -0.03664682～0.05499584
             # 食指z : 0.03804432-0.19527645
             # x_norm = 2 * (x - min) / (max - min) - 1
-            finger_tip_pos_x_min = 0.0
-            finger_tip_pos_x_max = 0.096
-            finger_tip_pos_y_min = -0.03664682
-            finger_tip_pos_y_max = 0.05499584
-            finger_tip_pos_z_min = 0.03804432
-            finger_tip_pos_z_max = 0.19527645
+            finger_tip_pos_x_min = [0.01051468, -0.01408456,-0.02309369, -0.01941702,-0.01198453]      
+            finger_tip_pos_x_max = [0.08438421, 0.096,      0.09327604 , 0.09595964, 0.10003495]
+            finger_tip_pos_y_min = [-0.04537681,-0.03664682,-0.03951727, -0.06925806, -0.09866672]
+            finger_tip_pos_y_max = [0.12591782, 0.05499584, 0.05443658, 0.02417522,-0.00785031]
+            finger_tip_pos_z_min = [0.05079299, 0.03804432, 0.03675804, 0.03169484, 0.02277947]
+            finger_tip_pos_z_max = [0.13120497, 0.19527645, 0.19265326, 0.1871634, 0.1754161]
 
             sensor_force = 0.1
             pose_error = 5.0
@@ -210,7 +210,7 @@ class WujiRobotCfgPPO(BaseConfig):
         
     class algorithm:
         # training params
-        value_loss_coef = 2.0
+        value_loss_coef = 1.0
         use_clipped_value_loss = True
         clip_param = 0.15 # 0.2
         entropy_coef = 0.01

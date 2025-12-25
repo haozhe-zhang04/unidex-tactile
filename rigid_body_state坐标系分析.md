@@ -152,3 +152,7 @@ finger_tip_env_local = finger_tip_world - self.env_origins
 
 
 
+
+
+
+

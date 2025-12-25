@@ -1,0 +1,2280 @@
+from legged_gym import LEGGED_GYM_ROOT_DIR, envs
+import time
+from warnings import WarningMessage
+import numpy as np
+import os
+
+from isaacgym.torch_utils import *
+from isaacgym import gymtorch, gymapi, gymutil
+
+from collections import deque
+import torch
+from torch import Tensor
+from typing import Tuple, Dict
+
+from legged_gym import LEGGED_GYM_ROOT_DIR
+from legged_gym.envs.base.base_task import BaseTask
+from legged_gym.utils.math import wrap_to_pi
+from legged_gym.utils.helpers import class_to_dict
+from legged_gym.utils.terrain import Terrain, Terrain_Perlin
+from legged_gym.utils.isaacgym_utils import euler_from_quat, sphere2cart, cart2sphere
+from legged_gym.envs.wuji.wuji_pos_force_config import WujiRobotCfg
+
+import matplotlib.pyplot as plt
+from pinocchio.robot_wrapper import RobotWrapper
+import pinocchio as pin
+import numpy as np
+
+
+
+INDEX_TIP_FORCE_X = 0
+INDEX_TIP_FORCE_Y = 1
+INDEX_TIP_FORCE_Z = 2
+INDEX_TIP_TORQUE_X = 3
+INDEX_TIP_TORQUE_Y = 4
+INDEX_TIP_TORQUE_Z = 5
+INDEX_TIP_POS_X_CMD = 6
+INDEX_TIP_POS_Y_CMD = 7
+INDEX_TIP_POS_Z_CMD = 8
+INDEX_TIP_ORIENTATION_X_CMD = 9
+INDEX_TIP_ORIENTATION_Y_CMD = 10
+INDEX_TIP_ORIENTATION_Z_CMD = 11
+INDEX_TIP_ORIENTATION_W_CMD = 12
+
+def quat_to_rotation_matrix(quat):
+    """
+    将四元数转换为旋转矩阵 (GPU优化版本)
+    
+    Args:
+        quat: tensor of shape (..., 4)  四元数 [x, y, z, w]
+    Returns:
+        R: tensor of shape (..., 3, 3)  旋转矩阵
+    """
+    # 归一化四元数
+    quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
+    
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    
+    # 计算旋转矩阵元素（避免重复计算）
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    xw, yw, zw = x * w, y * w, z * w
+    
+    # 构建旋转矩阵
+    R = torch.stack([
+        torch.stack([1 - 2*(yy + zz), 2*(xy - zw), 2*(xz + yw)], dim=-1),
+        torch.stack([2*(xy + zw), 1 - 2*(xx + zz), 2*(yz - xw)], dim=-1),
+        torch.stack([2*(xz - yw), 2*(yz + xw), 1 - 2*(xx + yy)], dim=-1),
+    ], dim=-2)
+    
+    return R
+    
+def get_euler_xyz_tensor(quat):
+    r, p, w = get_euler_xyz(quat)
+    # stack r, p, w in dim1
+    euler_xyz = torch.stack((r, p, w), dim=1)
+    euler_xyz[euler_xyz > np.pi] -= 2 * np.pi
+    return euler_xyz
+
+def quat_conjugate(quat):
+    """
+    计算四元数的共轭
+    
+    Args:
+        quat: tensor of shape (..., 4)  四元数 [x, y, z, w]
+    Returns:
+        quat_conj: tensor of shape (..., 4)  共轭四元数 [-x, -y, -z, w]
+    """
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    return torch.stack([-x, -y, -z, w], dim=-1)
+
+def quat_mul(q1, q2):
+    """
+    批量四元数乘法 (Hamilton product)
+    
+    Args:
+        q1: tensor of shape (..., 4)  四元数 [x, y, z, w]
+        q2: tensor of shape (..., 4)  四元数 [x, y, z, w]
+
+    Returns:
+        q: tensor of shape (..., 4)  四元数乘积 q = q1 * q2
+    """
+    assert q1.shape[-1] == 4 and q2.shape[-1] == 4, "输入最后一维必须是4"
+
+    x1, y1, z1, w1 = q1.unbind(-1)
+    x2, y2, z2, w2 = q2.unbind(-1)
+
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+
+    return torch.stack([x, y, z, w], dim=-1)
+
+def mat3x3_to_xyzw(R):
+    """
+    将旋转矩阵转换为四元数 (GPU优化版本)
+    
+    Args:
+        R: tensor of shape (..., 3, 3)  旋转矩阵，支持批量处理
+    Returns:
+        quat: tensor of shape (..., 4)  四元数 [x, y, z, w]
+    
+    使用 Shepperd's method，避免数值不稳定，GPU友好
+    """
+    # 提取矩阵元素（避免重复索引）
+    m00, m01, m02 = R[..., 0, 0], R[..., 0, 1], R[..., 0, 2]
+    m10, m11, m12 = R[..., 1, 0], R[..., 1, 1], R[..., 1, 2]
+    m20, m21, m22 = R[..., 2, 0], R[..., 2, 1], R[..., 2, 2]
+    
+    # 计算迹
+    trace = m00 + m11 + m22
+    
+    # 初始化四元数（自动继承设备、dtype）
+    device = R.device
+    dtype = R.dtype
+    shape = R.shape[:-2]  # 除了最后两个维度 (3, 3)
+    
+    qx = torch.zeros(shape, device=device, dtype=dtype)
+    qy = torch.zeros(shape, device=device, dtype=dtype)
+    qz = torch.zeros(shape, device=device, dtype=dtype)
+    qw = torch.zeros(shape, device=device, dtype=dtype)
+    
+    # Case 1: trace > 0 (最常见情况，优先处理)
+    cond1 = trace > 0
+    if cond1.any():
+        s = torch.sqrt(trace[cond1] + 1.0) * 2.0  # s = 4 * qw
+        qw[cond1] = s * 0.25
+        qx[cond1] = (m21[cond1] - m12[cond1]) / s
+        qy[cond1] = (m02[cond1] - m20[cond1]) / s
+        qz[cond1] = (m10[cond1] - m01[cond1]) / s
+    
+    # Case 2: m00 最大
+    cond2 = (~cond1) & (m00 >= m11) & (m00 >= m22)
+    if cond2.any():
+        s = torch.sqrt(1.0 + m00[cond2] - m11[cond2] - m22[cond2]) * 2.0
+        qx[cond2] = s * 0.25
+        qw[cond2] = (m21[cond2] - m12[cond2]) / s
+        qy[cond2] = (m01[cond2] + m10[cond2]) / s
+        qz[cond2] = (m02[cond2] + m20[cond2]) / s
+    
+    # Case 3: m11 最大
+    cond3 = (~cond1) & (~cond2) & (m11 >= m22)
+    if cond3.any():
+        s = torch.sqrt(1.0 + m11[cond3] - m00[cond3] - m22[cond3]) * 2.0
+        qy[cond3] = s * 0.25
+        qw[cond3] = (m02[cond3] - m20[cond3]) / s
+        qx[cond3] = (m01[cond3] + m10[cond3]) / s
+        qz[cond3] = (m12[cond3] + m21[cond3]) / s
+    
+    # Case 4: m22 最大
+    cond4 = (~cond1) & (~cond2) & (~cond3)
+    if cond4.any():
+        s = torch.sqrt(1.0 + m22[cond4] - m00[cond4] - m11[cond4]) * 2.0
+        qz[cond4] = s * 0.25
+        qw[cond4] = (m10[cond4] - m01[cond4]) / s
+        qx[cond4] = (m02[cond4] + m20[cond4]) / s
+        qy[cond4] = (m12[cond4] + m21[cond4]) / s
+    
+    # 堆叠并归一化
+    quat = torch.stack([qx, qy, qz, qw], dim=-1)
+    # 归一化（添加小量避免除零）
+    norm = torch.norm(quat, dim=-1, keepdim=True) + 1e-8
+    quat = quat / norm
+    
+    return quat
+
+# 球形插值四元数
+def slerp_xyzw(q0, q1, t, eps=1e-6):
+    """
+    SLERP for quaternions in xyzw format
+    Args:
+        q0: tensor (...,4) start quaternion in xyzw
+        q1: tensor (...,4) end quaternion in xyzw
+        t:  interpolation factor (...,1) or float in [0,1]
+        eps: small number to avoid division by zero
+    Returns:
+        q_interp: tensor (...,4) interpolated quaternion in xyzw
+    """
+    # convert to wxyz for easier computation
+    q0_wxyz = torch.stack([q0[...,3], q0[...,0], q0[...,1], q0[...,2]], dim=-1)
+    q1_wxyz = torch.stack([q1[...,3], q1[...,0], q1[...,1], q1[...,2]], dim=-1)
+
+    # normalize
+    q0_wxyz = q0_wxyz / q0_wxyz.norm(dim=-1, keepdim=True)
+    q1_wxyz = q1_wxyz / q1_wxyz.norm(dim=-1, keepdim=True)
+
+    # dot product
+    dot = (q0_wxyz * q1_wxyz).sum(dim=-1, keepdim=True)
+
+    # if dot < 0, invert q1 to take the shortest path
+    q1_wxyz = torch.where(dot < 0, -q1_wxyz, q1_wxyz)
+    dot = torch.clamp(dot, -1.0, 1.0)  # clamp for numerical stability
+
+    # compute theta
+    theta_0 = torch.acos(dot)  # angle between q0 and q1
+    sin_theta_0 = torch.sin(theta_0)
+
+    # if angle is small, use lerp
+    use_lerp = sin_theta_0 < eps
+    # compute coefficients
+    coeff0 = torch.where(use_lerp, 1.0 - t, torch.sin((1.0 - t) * theta_0) / sin_theta_0)
+    coeff1 = torch.where(use_lerp, t, torch.sin(t * theta_0) / sin_theta_0)
+
+    # interpolate
+    q_interp_wxyz = coeff0 * q0_wxyz + coeff1 * q1_wxyz
+    q_interp_wxyz = q_interp_wxyz / q_interp_wxyz.norm(dim=-1, keepdim=True)  # normalize
+
+    # convert back to xyzw
+    q_interp_xyzw = torch.stack([q_interp_wxyz[...,1], q_interp_wxyz[...,2], q_interp_wxyz[...,3], q_interp_wxyz[...,0]], dim=-1)
+
+    return q_interp_xyzw
+
+# 四元数转换为旋转矩阵前6维
+def quat_to_mat6d(quat):
+    rot_matrices = quat_to_rotation_matrix(quat) 
+    
+    # 2. 提取前两列
+    # col1: X轴方向 (num_envs, 3)
+    col1 = rot_matrices[:, :, 0] 
+    # col2: Y轴方向 (num_envs, 3)
+    col2 = rot_matrices[:, :, 1]
+    
+    # 3. 拼接成 6D 向量 (num_envs, 6)
+    mat6d = torch.cat([col1, col2], dim=-1)
+    return mat6d
+
+class WujiRobot_pos_force(BaseTask):
+    def __init__(self, cfg: WujiRobotCfg, sim_params, physics_engine, sim_device, headless):
+        """ Parses the provided config file,
+            calls create_sim() (which creates, simulation and environments),
+            initilizes pytorch buffers used during training
+
+        Args:
+            cfg (Dict): Environment config file
+            sim_params (gymapi.SimParams): simulation parameters
+            physics_engine (gymapi.SimType): gymapi.SIM_PHYSX (must be PhysX)
+            device_type (string): 'cuda' or 'cpu'
+            device_id (int): 0, 1, ...
+            headless (bool): Run without rendering if True
+        """ 
+        self.cfg = cfg
+        self.sim_params = sim_params
+        self.height_samples = None
+        self.debug_viz = True
+        self.debug_curve = False
+
+        if self.debug_curve:
+            pass
+
+        self.init_done = False
+        self._parse_cfg(self.cfg)
+        super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+        self.num_pred_obs = self.cfg.env.num_pred_obs
+        self.num_single_obs = self.cfg.env.num_single_obs
+        self.obs_pred = torch.zeros(self.num_envs, self.num_pred_obs, device=self.device, dtype=torch.float)
+
+        if not self.headless:
+            self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
+        self._init_buffers()
+        self._prepare_reward_function()
+        self.init_done = True
+        
+    def step(self, actions):
+
+        """ Apply actions, simulate, call self.post_physics_step()
+
+        Args:
+            actions (torch.Tensor): Tensor of shape (num_envs, num_actions_per_env)
+        """
+        
+        clip_actions = self.cfg.normalization.clip_actions
+        self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+
+        if not self.headless:
+            self.render()
+        
+        # actions为 delta action
+        for _ in range(self.cfg.control.decimation):
+            if self.cfg.control.use_delta_action:
+                self.dof_pos_target[:,4:8] = self.actions[:,:4] * self.cfg.control.action_scale + self.dof_pos[:,4:8]
+
+            else:
+                # 绝对位置控制
+                self.dof_pos_target[:,4:8] = self.actions[:,:4] * self.cfg.control.action_scale + self.default_dof_pos[4:8].unsqueeze(0)
+
+            # ⭐ 关键：裁剪到关节限制范围内
+            self.dof_pos_target[:,4:8] = torch.clamp(
+                self.dof_pos_target[:,4:8],
+                self.dof_pos_limits[4:8, 0],  # lower limits
+                self.dof_pos_limits[4:8, 1]   # upper limits
+            )      
+
+            self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
+
+            if self.global_steps > self.cfg.commands.force_start_step * 24:
+                self._push_finger_tip(torch.arange(self.num_envs, device=self.device))  
+
+            self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces[:,:,:3].reshape(-1, 3).contiguous()), None, gymapi.LOCAL_SPACE)
+            self.gym.simulate(self.sim)
+            self.gym.refresh_dof_state_tensor(self.sim)
+        # for _ in range(self.cfg.control.decimation):
+        #     self.torques = self._compute_torques(self.actions)
+        #     self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
+        #     if self.cfg.env.test:
+        #         elapsed_time = self.gym.get_elapsed_time(self.sim)
+        #         sim_time = self.gym.get_sim_time(self.sim)
+        #         if sim_time-elapsed_time>0:
+        #             time.sleep(sim_time-elapsed_time)
+            
+        #     if self.device == 'cpu':
+        #         self.gym.fetch_results(self.sim, True)
+
+        #     if self.global_steps > self.cfg.commands.force_start_step * 24:
+        #         # push gripper
+                # self._push_gripper(torch.arange(self.num_envs, device=self.device))      
+        #         # push robot base 
+        #         # self._push_robot_base(torch.arange(self.num_envs, device=self.device)) 
+        #     self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces), None, gymapi.GLOBAL_SPACE)
+        #     self.gym.simulate(self.sim)
+        #     self.gym.refresh_dof_state_tensor(self.sim)
+        self.post_physics_step()
+
+        # return clipped obs, clipped states (None), rewards, dones and infos
+        clip_obs = self.cfg.normalization.clip_observations
+        self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
+        self.obs_pred = torch.clip(self.obs_pred, -clip_obs, clip_obs)
+        if self.privileged_obs_buf is not None:
+            self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
+        self.global_steps += 1
+        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf, 'obs_pred': self.obs_pred}, self.rew_buf, self.reset_buf, self.extras,self.reward_logs
+
+
+    def post_physics_step(self):
+        """ check terminations, compute observations and rewards
+            calls self._post_physics_step_callback() for common computations 
+            calls self._draw_debug_vis() if needed
+        """
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_force_sensor_tensor(self.sim)
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+
+
+        # self._post_physics_step_callback()
+
+
+        # update ee goal
+        self.update_curr_ee_goal()
+
+
+        # compute observations, rewards, resets, ...
+        self.check_termination()
+        self.compute_reward()
+        env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.reset_idx(env_ids)
+        self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
+
+        self.last_last_actions[:] = torch.clone(self.last_actions[:])
+        self.last_actions[:] = self.actions[:]
+        self.last_dof_vel[:] = self.dof_vel[:]
+        self.last_rigid_state[:] = self.rigid_state[:]
+
+        # 更新传感器的世界坐标
+        for i in range(1):
+            # breakpoint()
+            link_pos = self.rigid_state[:, self.finger_tips_idx,:3].clone()
+            link_q = self.rigid_state[:, self.finger_tips_idx,3:7].clone()
+            offset = self.sensors_pos_link[i, :3].view(1, 1, 3)   # (1,1,3)
+            offset = offset.expand_as(link_pos)     
+            self.sensors_world[:, i, :3] = (link_pos + offset).squeeze(1)            
+
+            q_rel = self.sensors_pos_link[i, 3:7].reshape(1, 1, 4)  # (1,1,4)
+            self.sensors_world[:, i, 3:7] = quat_mul(link_q , q_rel).squeeze(1)
+        if self.viewer and self.enable_viewer_sync and self.debug_viz:
+            self.gym.clear_lines(self.viewer)
+        #     # self._draw_debug_vis()
+        #     self.gym.clear_lines(self.viewer)
+            self._draw_ee_goal_curr()
+            self._draw_ee()
+        #     self._draw_ee_goal_traj()
+        #     self._draw_collision_bbox()
+            # self._draw_ee_force()
+        #     self._draw_base_force()
+        #     self._draw_curve()
+
+    def _draw_ee(self):
+        sphere_geom = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(1, 1, 0))
+        # 直接从 rigid_state 读取最新位置
+        finger_tip_pos_world = self.rigid_state[:, self.finger_tips_idx, :3].clone().squeeze(1)
+        for i in range(self.num_envs):
+            sphere_pose = gymapi.Transform(gymapi.Vec3(finger_tip_pos_world[i, 0], finger_tip_pos_world[i, 1], finger_tip_pos_world[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+    
+    def check_termination(self):
+        """ Check if environments need to be reset
+        """
+        # self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        # self.reset_buf |= torch.logical_or(torch.abs(self.base_euler_xyz[:,1])>1.0, torch.abs(self.base_euler_xyz[:,0])>0.8)
+        self.reset_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
+        self.reset_buf |= self.time_out_buf
+
+    def reset_idx(self, env_ids):
+        """ Reset some environments.
+            Calls self._reset_dofs(env_ids), self._reset_root_states(env_ids), and self._resample_commands(env_ids)
+            [Optional] calls self._update_terrain_curriculum(env_ids), self.update_command_curriculum(env_ids) and
+            Logs episode info
+            Resets some buffers
+
+        Args:
+            env_ids (list[int]): List of environment ids which must be reset
+        """
+        if len(env_ids) == 0:
+            return
+        
+        # reset robot states
+        self._reset_dofs(env_ids)
+        # self._reset_root_states(env_ids)
+
+        # self._resample_commands(env_ids)
+        self._randomize_dof_props(env_ids)
+        self._resample_ee_goal(env_ids, is_init=True)
+
+        # reset buffers
+        self.last_last_actions[env_ids] = 0.
+        self.actions[env_ids] = 0.
+        self.last_actions[env_ids] = 0.
+        self.last_rigid_state[env_ids] = 0.
+        self.last_dof_vel[env_ids] = 0.
+        self.episode_length_buf[env_ids] = 0
+        # self.gait_indices[env_ids] = 0
+        self.reset_buf[env_ids] = 1
+        self.goal_timer[env_ids] = 0.
+
+        # force control
+        self.forces[env_ids, self.finger_tips_idx, :3] = 0.
+        self.selected_env_ids_finger_tips_cmd[env_ids] = 0
+        self.selected_env_ids_finger_tips_ext[env_ids] = 0
+        self.push_end_time_finger_tips_cmd[env_ids] = 0.
+        self.force_target_finger_tips_cmd[env_ids, :3] = 0.
+        self.force_target_finger_tips_ext[env_ids, :3] = 0.
+        self.push_duration_finger_tips_cmd[env_ids] = 0.
+        self.current_Fxyz_finger_tips_cmd[env_ids, :3] = 0.
+
+
+        self.commands[env_ids, INDEX_TIP_FORCE_X] = 0.0
+        self.commands[env_ids, INDEX_TIP_FORCE_Y] = 0.0
+        self.commands[env_ids, INDEX_TIP_FORCE_Z] = 0.0
+
+
+        # Reset push gripper 
+        if self.cfg.commands.push_finger_tips:
+            self.forces[env_ids, self.finger_tips_idx, :3] = 0.
+            self.selected_env_ids_finger_tips_cmd[env_ids] = 0
+            self.selected_env_ids_finger_tips_ext[env_ids] = 0
+            self.push_end_time_finger_tips_cmd[env_ids] = 0.
+
+
+        # fill extras
+        self.extras["episode"] = {}
+        for key in self.episode_sums.keys():
+            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
+            self.episode_sums[key][env_ids] = 0.
+        if self.cfg.commands.curriculum:
+            self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
+        # send timeout info to the algorithm
+        if self.cfg.env.send_timeouts:
+            self.extras["time_outs"] = self.time_out_buf
+            
+
+        for i in range(self.obs_history.maxlen):
+            self.obs_history[i][env_ids] *= 0
+        for i in range(self.critic_history.maxlen):
+            self.critic_history[i][env_ids] *= 0
+        
+    def compute_reward(self):
+        """ Compute rewards
+            Calls each reward function which had a non-zero scale (processed in self._prepare_reward_function())
+            adds each terms to the episode sums and to the total reward
+        """
+        self.rew_buf[:] = 0.
+        for i in range(len(self.reward_functions)):
+            name = self.reward_names[i]
+            rew = self.reward_functions[i]() * self.reward_scales[name]
+            self.rew_buf += rew
+            self.reward_logs[name]=rew
+
+        if self.cfg.rewards.only_positive_rewards:
+            self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
+        # add termination reward after clipping
+        if "termination" in self.reward_scales:
+            rew = self._reward_termination() * self.reward_scales["termination"]
+            self.rew_buf += rew
+            self.episode_sums["termination"] += rew
+    
+    def get_body_orientation(self, return_yaw=False):
+        r, p, y = euler_from_quat(self.base_quat)
+        body_angles = torch.stack([r, p, y], dim=-1)
+
+        if not return_yaw:
+            return body_angles[:, :-1]
+        else:
+            return body_angles
+        
+    def compute_observations(self):
+        """ Computes observations
+        """
+
+        # finger_tip_pos
+        finger_tip_pos_world = self.rigid_state[:,self.finger_tips_idx, :3].clone().squeeze(1)
+        finger_tip_pos_base = quat_rotate_inverse(self.base_quat, finger_tip_pos_world - self.base_pos)
+        # finger_tip_orn
+        finger_tip_orn_quat_world = self.rigid_state[:,self.finger_tips_idx, 3:7].clone().squeeze(1)
+        finger_tip_orn_quat_base = quat_mul(quat_conjugate(self.base_quat), finger_tip_orn_quat_world)
+        # 归一化四元数（防止NaN）
+        finger_tip_orn_quat_base = finger_tip_orn_quat_base / (torch.norm(finger_tip_orn_quat_base, dim=-1, keepdim=True) + 1e-8)
+        finger_tip_orn_6d_base = quat_to_mat6d(finger_tip_orn_quat_base)
+        # finger_tip_vel
+        finger_tip_vel_world = self.rigid_state[:,self.finger_tips_idx, 7:10].clone().squeeze(1)
+        finger_tip_vel_base = quat_rotate_inverse(self.base_quat, finger_tip_vel_world)
+
+        # force+pos
+        forces_local = self.sensors_forces[:, 0, :3]
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
+        forces_offset_local = (forces_local + forces_cmd_local)
+
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1), forces_offset_local)
+
+        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
+        curr_finger_tip_goal_cart_base = quat_rotate_inverse(self.base_quat,curr_ee_goal_cart_world_offset)
+
+        # error
+        finger_tip_pos_error = finger_tip_pos_base - curr_finger_tip_goal_cart_base
+
+        # 归一化目标姿态四元数（防止NaN）
+        curr_finger_tip_goal_orn_normalized = self.curr_finger_tip_goal_orn / (torch.norm(self.curr_finger_tip_goal_orn, dim=-1, keepdim=True) + 1e-8)
+        curr_finger_tip_goal_orn_6d_base = quat_to_mat6d(curr_finger_tip_goal_orn_normalized)
+        finger_tip_orn_6d_error = finger_tip_orn_6d_base - curr_finger_tip_goal_orn_6d_base
+
+        # sensor_forces
+        sensor_forces_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),self.sensors_forces[:,0,:3].clone().squeeze(1))
+        sensor_forces_base = quat_rotate_inverse(self.base_quat,sensor_forces_world)
+
+        F_cmd_local = self.commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]
+        F_cmd_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),F_cmd_local)
+        F_cmd_base = quat_rotate_inverse(self.base_quat,F_cmd_world)
+        commands = self.commands.clone()
+        commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)] = F_cmd_base
+
+        forces_error = sensor_forces_base - F_cmd_base
+
+
+        self.privileged_obs_buf = torch.cat((
+
+                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
+                                self.dof_vel[:,4:8]* self.cfg.normalization.obs_scales.dof_vel,#4
+                                self.actions[:,:4] * self.cfg.control.action_scale, # 4
+
+                                2 * (finger_tip_pos_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2 * (finger_tip_pos_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2 * (finger_tip_pos_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                # 食指旋转 6d
+                                finger_tip_orn_6d_base, # 6
+                                finger_tip_vel_base * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 3
+              
+                                2*(curr_finger_tip_goal_cart_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2*(curr_finger_tip_goal_cart_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2*(curr_finger_tip_goal_cart_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                finger_tip_pos_error * self.cfg.normalization.obs_scales.pose_error,# 3
+                                 # 旋转误差 6d
+                                finger_tip_orn_6d_error * self.cfg.normalization.obs_scales.orn_error,# 6
+                                forces_error* self.cfg.normalization.obs_scales.force_error,# 3
+
+                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
+
+                                2*(commands[:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_X_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2*(commands[:,INDEX_TIP_POS_Y_CMD:(INDEX_TIP_POS_Y_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2*(commands[:,INDEX_TIP_POS_Z_CMD:(INDEX_TIP_POS_Z_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                commands[:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] * self.cfg.normalization.obs_scales.orientation_cmd, # 4
+                                commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] * self.cfg.normalization.obs_scales.force_cmd,# 3
+                            ),dim=-1) # 52
+        obs_pred = torch.cat((
+                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
+                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
+                                finger_tip_vel_base * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 3
+                                forces_error * self.cfg.normalization.obs_scales.force_error,# 3
+                            ),dim=-1) #13
+
+        obs_buf = torch.cat((   
+                                # 关节角度
+                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
+                                # 上一次动作
+                                self.actions[:,:4] * self.cfg.control.action_scale,
+                                # 食指位置
+                                2 * (finger_tip_pos_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2 * (finger_tip_pos_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2 * (finger_tip_pos_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                # 食指旋转 6d
+                                finger_tip_orn_6d_base, #6
+                                # 目标位置
+                                2*(curr_finger_tip_goal_cart_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2*(curr_finger_tip_goal_cart_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2*(curr_finger_tip_goal_cart_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                # 位置误差
+                                finger_tip_pos_error * self.cfg.normalization.obs_scales.pose_error,# 3
+                                # 旋转误差 6d
+                                finger_tip_orn_6d_error * self.cfg.normalization.obs_scales.orn_error,# 6
+                                # 传感器力
+                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
+                                # 力误差
+                                forces_error * self.cfg.normalization.obs_scales.force_error,# 3
+                                # 目标位置
+                                2*(commands[:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_X_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
+                                2*(commands[:,INDEX_TIP_POS_Y_CMD:(INDEX_TIP_POS_Y_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
+                                2*(commands[:,INDEX_TIP_POS_Z_CMD:(INDEX_TIP_POS_Z_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                 # 目标旋转
+                                commands[:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] * self.cfg.normalization.obs_scales.orientation_cmd, # 4
+                                # 目标力
+                                commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] * self.cfg.normalization.obs_scales.force_cmd, # 3
+                            ),dim=-1) #45
+        # add perceptive inputs if not blind
+        # add noise if needed
+        if self.add_noise:  
+            obs_now = obs_buf.clone() + torch.randn_like(obs_buf) * self.noise_scale_vec * self.cfg.noise.noise_level
+        else:
+            obs_now = obs_buf.clone()
+
+        self.obs_history.append(obs_now)
+        self.critic_history.append(self.privileged_obs_buf)
+
+        obs_buf_all = torch.stack([self.obs_history[i]
+                                   for i in range(self.obs_history.maxlen)], dim=1)  # N,T,K
+        self.obs_pred = obs_pred.clone()
+        self.obs_buf = obs_buf_all.reshape(self.num_envs, -1)  # N, T*K
+        self.privileged_obs_buf = torch.cat([self.critic_history[i] for i in range(self.cfg.env.c_frame_stack)], dim=1)
+
+    def get_observations(self):
+        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf, 'obs_pred': self.obs_pred}
+    
+    def create_sim(self):
+        """ Creates simulation, terrain and evironments
+        """
+        self.up_axis_idx = 2 # 2 for z, 1 for y -> adapt gravity accordingly
+        self.sim = self.gym.create_sim(self.sim_device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
+        self.terrain = Terrain(self.cfg.terrain, )
+        self._create_trimesh()
+        # self._create_ground_plane()
+        self._create_envs()
+
+    def set_camera(self, position, lookat):
+        """ Set camera position and direction
+        """
+        cam_pos = gymapi.Vec3(position[0], position[1], position[2])
+        cam_target = gymapi.Vec3(lookat[0], lookat[1], lookat[2])
+        self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
+
+    def _draw_curve(self):
+        if self.debug_curve:
+
+            self.ax1.set_ylim(self.default_dof_pos_wo_gripper[0, self.FL_joint_index].item()-1.5, self.default_dof_pos_wo_gripper[0, self.FL_joint_index].item()+1.5)
+            self.ax1.set_title(f"FL_joint_{self.FL_joint_index}")
+            self.ax1.set_xlabel("time / s")
+            self.ax1.legend(loc="upper right")
+            self.ax2.set_ylim(self.default_dof_pos_wo_gripper[0, self.FR_joint_index].item()-1.5, self.default_dof_pos_wo_gripper[0, self.FR_joint_index].item()+1.5)
+            self.ax2.set_title(f"FL_joint_{self.FR_joint_index}")
+            self.ax2.set_xlabel("time / s")
+            self.ax2.legend(loc="upper right")
+
+            self.ax3.set_ylim(self.default_dof_pos_wo_gripper[0, self.FL_joint_index].item()-1.5, self.default_dof_pos_wo_gripper[0, self.FL_joint_index].item()+1.5)
+            self.ax3.set_title(f"front_ref_motion")
+            self.ax3.set_xlabel("time / s")
+            self.ax3.legend(loc="upper right")
+
+            self.ax4.set_ylim(self.default_dof_pos_wo_gripper[0, self.RL_joint_index].item()-1.5, self.default_dof_pos_wo_gripper[0, self.RL_joint_index].item()+1.5)
+            self.ax4.set_title(f"FL_joint_{self.RL_joint_index}")
+            self.ax4.set_xlabel("time / s")
+            self.ax4.legend(loc="upper right")
+            self.ax5.set_ylim(self.default_dof_pos_wo_gripper[0, self.RR_joint_index].item()-1.5, self.default_dof_pos_wo_gripper[0, self.RR_joint_index].item()+1.5)
+            self.ax5.set_title(f"FL_joint_{self.RR_joint_index}")
+            self.ax5.set_xlabel("time / s")
+            self.ax5.legend(loc="upper right")
+
+            self.ax6.set_ylim(-.5, 1.5)
+            self.ax6.set_title(f"ront_ref_motion")
+            self.ax6.set_xlabel("time / s")
+            self.ax6.legend(loc="upper right")
+
+            self.t_data.append(self.global_steps)
+            self.FL_action.append(self.actions[0, self.FL_joint_index].item() * self.cfg.control.action_scale + self.default_dof_pos_wo_gripper[0, self.FR_joint_index].item())
+            self.FL_state.append(self.dof_pos[0, self.FL_joint_index].item())
+            self.FL_ref.append(self.ref_dof_pos[0, self.FL_joint_index].item())
+            self.FR_action.append(self.actions[0, self.FR_joint_index].item() * self.cfg.control.action_scale + self.default_dof_pos_wo_gripper[0, self.FR_joint_index].item())
+            self.FR_state.append(self.dof_pos[0, self.FR_joint_index].item())
+            self.FR_ref.append(self.ref_dof_pos[0, self.FR_joint_index].item())
+
+            # stand_mask = self._get_gait_phase()
+            self.RL_action.append(self.actions[0, self.RL_joint_index].item() * self.cfg.control.action_scale + self.default_dof_pos_wo_gripper[0, self.RR_joint_index].item())
+            self.RL_state.append(self.dof_pos[0, self.RL_joint_index].item())
+            self.RL_ref.append(self.ref_dof_pos[0, self.RL_joint_index].item())
+            self.RR_action.append(self.actions[0, self.RR_joint_index].item() * self.cfg.control.action_scale + self.default_dof_pos_wo_gripper[0, self.RR_joint_index].item())
+            self.RR_state.append(self.dof_pos[0, self.RR_joint_index].item())
+            self.RR_ref.append(self.ref_dof_pos[0, self.RR_joint_index].item())
+            
+            if len(self.t_data) > 100:
+                self.t_data.pop(0)
+                self.FL_action.pop(0)
+                self.FL_state.pop(0)
+                self.FL_ref.pop(0)
+                self.FR_action.pop(0)
+                self.FR_state.pop(0)
+                self.FR_ref.pop(0)
+                self.RL_action.pop(0)
+                self.RL_state.pop(0)
+                self.RL_ref.pop(0)
+                self.RR_action.pop(0)
+                self.RR_state.pop(0)
+                self.RR_ref.pop(0)
+            self.FL_action_line.set_data(self.t_data, self.FL_action)
+            self.FL_state_line.set_data(self.t_data, self.FL_state)
+            self.FL_ref_line.set_data(self.t_data, self.FL_ref)
+            self.FR_action_line.set_data(self.t_data, self.FR_action)
+            self.FR_state_line.set_data(self.t_data, self.FR_state)
+            self.FR_ref_line.set_data(self.t_data, self.FR_ref)
+
+            self.RL_action_line.set_data(self.t_data, self.RL_action)
+            self.RL_state_line.set_data(self.t_data, self.RL_state)
+            self.RL_ref_line.set_data(self.t_data, self.RL_ref)
+            self.RR_action_line.set_data(self.t_data, self.RR_action)
+            self.RR_state_line.set_data(self.t_data, self.RR_state)
+            self.RR_ref_line.set_data(self.t_data, self.RR_ref)
+            self.ax1.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            self.ax2.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            self.ax3.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            self.ax4.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            self.ax5.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            self.ax6.set_xlim(max(0, self.global_steps - 100), self.global_steps + 1)
+            plt.pause(0.001)
+            # print(self.commands)
+    def _draw_collision_bbox(self):
+
+        center = self.ee_goal_center_offset
+        bbox0 = center + self.collision_upper_limits
+        bbox1 = center + self.collision_lower_limits
+        bboxes = torch.stack([bbox0, bbox1], dim=1)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.05, 4, 4, None, color=(1, 1, 0))
+
+        for i in range(self.num_envs):
+            bbox_geom = gymutil.WireframeBBoxGeometry(bboxes[i], None, color=(1, 0, 0))
+            quat = self.base_yaw_quat[i]
+            r = gymapi.Quat(quat[0], quat[1], quat[2], quat[3])
+            pose0 = gymapi.Transform(gymapi.Vec3(self.root_states[i, 0], self.root_states[i, 1], 0), r=r)
+            gymutil.draw_lines(bbox_geom, self.gym, self.viewer, self.envs[i], pose=pose0) 
+
+           
+    def _draw_ee_goal_curr(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        # self.gym.refresh_rigid_body_state_tensor(self.sim)
+        sphere_geom = gymutil.WireframeSphereGeometry(0.001, 4, 4, None, color=(1, 1, 0)) # 黄
+
+        sphere_geom_4 = gymutil.WireframeSphereGeometry(0.001, 4, 4, None, color=(1, 0, 1)) # 紫
+
+        sphere_geom_2 = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(0, 0, 1)) # 蓝
+        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3]
+
+        sphere_geom_origin = gymutil.WireframeSphereGeometry(0.001, 8, 8, None, color=(0, 1, 0)) # 绿
+        sphere_pose = gymapi.Transform(gymapi.Vec3(0, 0, 0), r=None)
+        gymutil.draw_lines(sphere_geom_origin, self.gym, self.viewer, self.envs[0], sphere_pose)
+
+        axes_geom = gymutil.AxesGeometry(scale=0.2)
+
+        forces_local = self.sensors_forces[:, 0, :3]
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1), forces_local + forces_cmd_local)
+        curr_finger_tip_goal_cart_global = quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
+
+        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + curr_finger_tip_goal_cart_global
+
+        # 将目标姿态从base坐标系转换到世界坐标系
+        # q_world = q_base_world * q_base
+        curr_finger_tip_goal_quat_base = self.curr_finger_tip_goal_orn
+        curr_finger_tip_goal_quat_world = quat_mul(self.base_quat, curr_finger_tip_goal_quat_base)
+
+        for i in range(self.num_envs):
+            # 当前的目标位置（x_cmd, y_cmd, z_cmd） 黄
+            sphere_pose = gymapi.Transform(gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], curr_finger_tip_goal_cart_global[i, 1], curr_finger_tip_goal_cart_global[i, 2]), r=None)
+            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+
+            # x_target, y_target, z_target 紫
+            sphere_pose_4 = gymapi.Transform(gymapi.Vec3(curr_ee_goal_cart_world_offset[i, 0].item(), curr_ee_goal_cart_world_offset[i, 1].item(), curr_ee_goal_cart_world_offset[i, 2].item()), r=None)
+            gymutil.draw_lines(sphere_geom_4, self.gym, self.viewer, self.envs[i], sphere_pose_4) #紫
+            
+            # sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i,0, 0].item(), ee_pose[i,0, 1].item(), ee_pose[i,0, 2].item()), r=None)
+            # gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) #蓝
+
+            # sphere_pose_3 = gymapi.Transform(gymapi.Vec3(upper_arm_pose[i, 0], upper_arm_pose[i, 1], upper_arm_pose[i, 2]), r=None)
+            # gymutil.draw_lines(sphere_geom_3, self.gym, self.viewer, self.envs[i], sphere_pose_3) 
+
+            # 绘制目标姿态的朝向（使用世界坐标系下的四元数）
+            # gymapi.Quat的参数顺序是 (x, y, z, w)
+            goal_quat_world = curr_finger_tip_goal_quat_world[i]
+            goal_quat_gymapi = gymapi.Quat(goal_quat_world[0].item(), goal_quat_world[1].item(), 
+                                           goal_quat_world[2].item(), goal_quat_world[3].item())
+            pose = gymapi.Transform(
+                gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], 
+                           curr_finger_tip_goal_cart_global[i, 1], 
+                           curr_finger_tip_goal_cart_global[i, 2]), 
+                r=goal_quat_gymapi
+            )
+            gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
+
+
+    def _draw_ee_force(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        sphere_geom_arrow_1 = gymutil.WireframeSphereGeometry(0.001, 16, 16, None, color=(0, 0, 1))
+        arrow_color_1 = [0, 0, 1]
+        sphere_geom_arrow_2 = gymutil.WireframeSphereGeometry(0.001, 16, 16, None, color=(0, 1, 0))
+        arrow_color_2 = [0, 1, 0]
+        
+
+        F_cmd = self.commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].clone()
+        F_cmd_gloal = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),F_cmd)
+        F_cmd_norm = torch.norm(F_cmd_gloal,dim=-1,keepdim=True)
+
+        ext_forces = self.forces[:,self.finger_tips_idx,:3].clone().squeeze(1)
+        ext_forces_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),ext_forces)
+        ext_forces_norm = torch.norm(ext_forces,dim=-1,keepdim=True)
+
+        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3].squeeze(1)
+
+        for i in range(self.num_envs):
+            # F_cmd 蓝色
+            start_pos = ee_pose[i].cpu().numpy()
+            arrow_direction = F_cmd_gloal[i].cpu().numpy()
+            arrow_length = F_cmd_norm[i].item() * 5
+            end_pos = start_pos + arrow_direction * arrow_length
+
+            verts = [start_pos, end_pos]
+            colors = [arrow_color_1, arrow_color_1]
+            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            head_pos = end_pos
+            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
+            
+            # ext_forces 绿色
+            start_pos = ee_pose[i].cpu().numpy()
+            arrow_direction = ext_forces_global[i].cpu().numpy()
+            arrow_length = ext_forces_norm[i].item() * 5
+            end_pos = start_pos + arrow_direction * arrow_length
+            verts = [start_pos, end_pos]
+            colors = [arrow_color_2, arrow_color_2]
+            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            head_pos = end_pos
+            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            gymutil.draw_lines(sphere_geom_arrow_2, self.gym, self.viewer, self.envs[i], head_pose)
+    
+    def _draw_base_force(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        sphere_geom_arrow_1 = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 0, 1))
+        arrow_color_1 = [0, 0, 1]
+        sphere_geom_arrow_2 = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 1, 0))
+        arrow_color_2 = [0, 1, 0]
+        base_pose = self.rigid_state[:, self.robot_base_idx, :3]
+        forces_global = self.forces[:, self.robot_base_idx, 0:3] / 100
+        forces_global_norm = torch.norm(forces_global, dim=-1, keepdim=True)
+        target_forces_global = forces_global / (forces_global_norm + 1e-5)
+        forces_cmd = self.current_Fxyz_base_cmd / 100
+        forces_cmd_global = quat_apply(self.base_yaw_quat, forces_cmd)
+        forces_cmd_norm = torch.norm(forces_cmd_global, dim=-1, keepdim=True)
+        target_forces_cmd = forces_cmd_global / (forces_cmd_norm + 1e-5)
+        for i in range(self.num_envs):
+
+            start_pos = base_pose[i].cpu().numpy() + [0, 0, 0.5]
+            arrow_direction = target_forces_global[i].cpu().numpy()
+            arrow_length = forces_global_norm[i].item()
+            end_pos = start_pos + arrow_direction * arrow_length
+            verts = [start_pos, end_pos]
+            colors = [arrow_color_1, arrow_color_1]
+            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            head_pos = end_pos
+            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
+
+            start_pos = base_pose[i].cpu().numpy() + [0, 0, 0.5]
+            arrow_direction = target_forces_cmd[i].cpu().numpy()
+            arrow_length = forces_cmd_norm[i].item()
+            end_pos = start_pos + arrow_direction * arrow_length
+            verts = [start_pos, end_pos]
+            colors = [arrow_color_2, arrow_color_2]
+            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            head_pos = end_pos
+            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            gymutil.draw_lines(sphere_geom_arrow_2, self.gym, self.viewer, self.envs[i], head_pose)
+            
+    def _draw_ee_goal_traj(self):
+        sphere_geom = gymutil.WireframeSphereGeometry(0.005, 8, 8, None, color=(1, 0, 0))
+        sphere_geom_yellow = gymutil.WireframeSphereGeometry(0.01, 16, 16, None, color=(1, 1, 0))
+
+        t = torch.linspace(0, 1, 10, device=self.device)[None, None, None, :]
+        ee_target_all_sphere = torch.lerp(self.ee_start_sphere[..., None], self.ee_goal_sphere[..., None], t).squeeze(0)
+        ee_target_all_cart_world = torch.zeros_like(ee_target_all_sphere)
+        for i in range(10):
+            ee_target_cart = sphere2cart(ee_target_all_sphere[..., i])
+            ee_target_all_cart_world[..., i] = quat_apply(self.base_yaw_quat, ee_target_cart)
+        ee_target_all_cart_world += self.get_ee_goal_spherical_center()[:, :, None]
+        for i in range(self.num_envs):
+            for j in range(10):
+                pose = gymapi.Transform(gymapi.Vec3(ee_target_all_cart_world[i, 0, j], ee_target_all_cart_world[i, 1, j], ee_target_all_cart_world[i, 2, j]), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], pose)
+    
+    def _draw_sensor_axes(self):
+        """
+        绘制食指指尖传感器的坐标系（X红、Y绿、Z蓝）。
+        """
+
+        if not self.viewer or not self.debug_viz or self.finger_tips_idx == -1:
+            return
+
+        axis_len = 0.1  # 坐标轴长度
+
+        for i in range(self.num_envs):
+            # 获取传感器世界坐标系状态
+            pos = self.sensors_world[i, 0, :3].cpu().numpy()     # (3,)
+            quat = self.sensors_world[i, 0, 3:].cpu().numpy()    # (4,)
+
+            # 使用 gymapi.Transform 将四元数和位置转换
+            t = gymapi.Transform(
+                p=gymapi.Vec3(*pos),
+                r=gymapi.Quat(*quat)
+            )
+
+            # 世界坐标系中的三个轴向量
+            x_axis = t.r.rotate(gymapi.Vec3(axis_len, 0, 0))
+            y_axis = t.r.rotate(gymapi.Vec3(0, axis_len, 0))
+            z_axis = t.r.rotate(gymapi.Vec3(0, 0, axis_len))
+
+            # 每条线需要两个顶点：起点和终点
+            verts = np.array([
+                [t.p.x, t.p.y, t.p.z], [t.p.x + x_axis.x, t.p.y + x_axis.y, t.p.z + x_axis.z],
+                [t.p.x, t.p.y, t.p.z], [t.p.x + y_axis.x, t.p.y + y_axis.y, t.p.z + y_axis.z],
+                [t.p.x, t.p.y, t.p.z], [t.p.x + z_axis.x, t.p.y + z_axis.y, t.p.z + z_axis.z],
+            ], dtype=np.float32)
+
+            # 对应的颜色
+            colors = np.array([
+                [1, 0, 0], [1, 0, 0],  # X 红
+                [0, 1, 0], [0, 1, 0],  # Y 绿
+                [0, 0, 0], [0, 0, 0],  # Z 蓝
+            ], dtype=np.float32)
+
+            # 绘制 3 条线段
+            self.gym.add_lines(
+                self.viewer,
+                self.envs[i],
+                3,        # line 数量
+                verts,
+                colors
+            )
+
+    def _draw_sensor_force(self):
+        """ Draws visualizations for dubugging (slows down simulation a lot).
+            Default behaviour: draws height measurement points
+        """
+        sphere_geom_arrow_1 = gymutil.WireframeSphereGeometry(0.02, 16, 16, None, color=(0, 0, 1))
+        arrow_color_1 = [0, 0, 1]
+
+        sensor_pose = self.sensors_world[:,0,:3]
+        sensor_force = self.sensors_forces[:,0,:3]
+
+        sensors_force_global = torch.norm(sensor_force, dim=-1, keepdim=True)
+
+        # ee_pose = self.rigid_state[:, self.gripper_idx, :3]
+        # forces_global = self.forces[:, self.gripper_idx, 0:3] / 100
+        # forces_global_norm = torch.norm(forces_global, dim=-1, keepdim=True)
+        # target_forces_global = forces_global / (forces_global_norm + 1e-5)
+        # forces_cmd = self.current_Fxyz_gripper_cmd / 100
+        # forces_cmd_global = quat_apply(self.base_yaw_quat, forces_cmd)
+        # forces_cmd_norm = torch.norm(forces_cmd_global, dim=-1, keepdim=True)
+        # target_forces_cmd = forces_cmd_global / (forces_cmd_norm + 1e-5)
+        for i in range(self.num_envs):
+
+            start_pos = sensor_pose[i].cpu().numpy()
+            arrow_direction = sensor_force[i].cpu().numpy()
+            arrow_length = sensors_force_global[i].item()
+            end_pos = start_pos + arrow_direction * arrow_length
+            verts = [start_pos, end_pos]
+            colors = [arrow_color_1, arrow_color_1]
+            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+            head_pos = end_pos
+            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+            gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
+        
+    #------------- Callbacks --------------
+    def _process_rigid_shape_props(self, props, env_id):
+        """ Callback allowing to store/change/randomize the rigid shape properties of each environment.
+            Called During environment creation.
+            Base behavior: randomizes the friction of each environment
+
+        Args:
+            props (List[gymapi.RigidShapeProperties]): Properties of each shape of the asset
+            env_id (int): Environment id
+
+        Returns:
+            [List[gymapi.RigidShapeProperties]]: Modified rigid shape properties
+        """
+        if self.cfg.domain_rand.randomize_friction:
+            if env_id==0:
+                # prepare friction randomization
+                friction_range = self.cfg.domain_rand.friction_range
+                num_buckets = 256
+                bucket_ids = torch.randint(0, num_buckets, (self.num_envs, 1))
+                friction_buckets = torch_rand_float(friction_range[0], friction_range[1], (num_buckets,1), device='cpu')
+                self.friction_coeffs = friction_buckets[bucket_ids]
+
+            for s in range(len(props)):
+                props[s].friction = self.friction_coeffs[env_id]
+
+            self.env_frictions[env_id] = self.friction_coeffs[env_id]
+        else:
+            self.friction_coeffs = torch.ones([self.num_envs, 1, 1])
+        return props
+    
+   
+
+    def _process_dof_props(self, props, env_id):
+        """ Callback allowing to store/change/randomize the DOF properties of each environment.
+            Called During environment creation.
+            Base behavior: stores position, velocity and torques limits defined in the URDF
+
+        Args:
+            props (numpy.array): Properties of each DOF of the asset
+            env_id (int): Environment id
+
+        Returns:
+            [numpy.array]: Modified DOF properties
+        """
+        if env_id==0:
+            self.dof_pos_limits = torch.zeros(self.num_dof, 2, dtype=torch.float, device=self.device, requires_grad=False)
+            self.dof_vel_limits = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+            self.torque_limits = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+            for i in range(len(props)):
+                self.dof_pos_limits[i, 0] = props["lower"][i].item()
+                self.dof_pos_limits[i, 1] = props["upper"][i].item()
+                self.dof_vel_limits[i] = props["velocity"][i].item()
+                self.torque_limits[i] = props["effort"][i].item()
+                # soft limits - 使用配置的soft_dof_pos_limit缩小关节限制范围
+                m = (self.dof_pos_limits[i, 0] + self.dof_pos_limits[i, 1]) / 2
+                r = self.dof_pos_limits[i, 1] - self.dof_pos_limits[i, 0]
+                self.dof_pos_limits[i, 0] = m - 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
+                self.dof_pos_limits[i, 1] = m + 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
+             # ⭐ 关键修复：为灵巧手关节（索引4:8）设置位置控制模式和PD参数
+            for i in range(len(props)):
+                if i >= 4 and i < 8:  # 灵巧手关节
+                    props["driveMode"][i] = gymapi.DOF_MODE_POS  # 位置控制模式
+                    # 从配置中获取 stiffness 和 damping
+                    name = self.dof_names[i]
+                    found = False
+                    for dof_name in self.cfg.control.stiffness.keys():
+                        if dof_name in name:
+                            props["stiffness"][i] = self.cfg.control.stiffness[dof_name]
+                            props["damping"][i] = self.cfg.control.damping[dof_name]
+                            found = True
+                            print("found!")
+                            break
+                    if not found:
+                        # 使用默认值
+                        props["stiffness"][i] = 120
+                        props["damping"][i] = 0.5
+        return props
+
+    def _randomize_dof_props(self, env_ids):
+        if self.cfg.commands.randomize_gripper_force_gains:
+            min_kp, max_kp = self.cfg.commands.gripper_force_kp_range
+            # min_kd, max_kd = self.cfg.commands.gripper_force_kd_range
+            self.gripper_force_kps[env_ids, :] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
+                                                     requires_grad=False).unsqueeze(1) * (
+                                                  max_kp - min_kp) + min_kp
+            # if self.cfg.commands.gripper_prop_kd > 0:
+            #     self.gripper_force_kds[env_ids, :] = self.gripper_force_kps[env_ids, :] * self.cfg.commands.gripper_prop_kd
+            # else:
+            #     self.gripper_force_kds[env_ids, :] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
+            #                                             requires_grad=False).unsqueeze(1) * (
+            #                                         max_kd - min_kd) + min_kd
+                
+    def _process_rigid_body_props(self, props, env_id):
+        if self.cfg.domain_rand.randomize_base_mass:
+            rng = self.cfg.domain_rand.added_mass_range
+            rand_mass = np.random.uniform(rng[0], rng[1], size=(1, ))
+            props[0].mass += rand_mass
+        else:
+            rand_mass = np.zeros(1)
+
+        if self.cfg.domain_rand.randomize_leg_mass:
+            rng_link = self.cfg.domain_rand.leg_mass_scale_range
+            rand_leg_masses = []
+            for idx in range(17):
+                rand_link_mass = np.random.uniform(rng_link[0], rng_link[1], size=(1, )) * props[idx].mass
+                props[idx].mass += rand_link_mass
+                rand_leg_masses.append(rand_link_mass)
+            rand_leg_masses = np.concatenate(rand_leg_masses)
+        else:
+            rand_leg_masses = np.zeros(17)
+
+        if self.cfg.domain_rand.randomize_gripper_mass:
+            gripper_rng_mass = self.cfg.domain_rand.gripper_added_mass_range
+            gripper_rand_mass = np.random.uniform(gripper_rng_mass[0], gripper_rng_mass[1], size=(1, ))
+            props[self.gripper_idx].mass += gripper_rand_mass
+        else:
+            gripper_rand_mass = np.zeros(1)
+
+        if self.cfg.domain_rand.randomize_base_com:
+            rng_com_x = self.cfg.domain_rand.added_com_range_x
+            rng_com_y = self.cfg.domain_rand.added_com_range_y
+            rng_com_z = self.cfg.domain_rand.added_com_range_z
+            rand_com = np.random.uniform([rng_com_x[0], rng_com_y[0], rng_com_z[0]], [rng_com_x[1], rng_com_y[1], rng_com_z[1]], size=(3, ))
+            props[1].com += gymapi.Vec3(*rand_com)
+        else:
+            rand_com = np.zeros(3)
+        
+        mass_params = np.concatenate([rand_mass, rand_com, gripper_rand_mass, rand_leg_masses])
+        return props, mass_params
+    
+    def _post_physics_step_callback(self):
+        """ Callback called before computing terminations, rewards, and observations
+            Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
+        """
+        # 
+        env_ids = (self.episode_length_buf % int(self.cfg.commands.resampling_time / self.dt)==0).nonzero(as_tuple=False).flatten()
+        self._resample_commands(env_ids)
+        self._randomize_dof_props(env_ids)
+        self._step_contact_targets()
+
+    def _step_contact_targets(self):
+        cycle_time = self.cfg.rewards.cycle_time
+        standing_mask = ~self.get_walking_cmd_mask()
+        self.gait_indices = torch.remainder(self.gait_indices + self.dt / cycle_time, 1.0)
+        self.gait_indices[standing_mask] = 0
+
+    # def _resample_commands(self, env_ids):
+    #     """ Randommly select commands of some environments
+
+    #     Args:
+    #         env_ids (List[int]): Environments ids for which new commands are needed
+    #     """
+    #     if self.cfg.env.teleop_mode:
+    #         return
+    #     self.commands[env_ids, 0] = torch_rand_float(self.command_ranges["lin_vel_x"][0], self.command_ranges["lin_vel_x"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+    #     self.commands[env_ids, 1] = torch_rand_float(self.command_ranges["lin_vel_y"][0], self.command_ranges["lin_vel_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+    #     self.commands[env_ids, 2] = torch_rand_float(self.command_ranges["ang_vel_yaw"][0], self.command_ranges["ang_vel_yaw"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        
+    #     zero_cmd_mask = torch.rand(len(env_ids), dtype=torch.float, device=self.device, requires_grad=False) < self.cfg.commands.zero_vel_cmd_prob
+    #     self.commands[env_ids, :3] *= ~zero_cmd_mask.unsqueeze(1)
+
+    #     # set small commands to zero
+    #     non_stop_sign = (torch.abs(self.commands[env_ids, 0]) > self.cfg.commands.lin_vel_x_clip) | (torch.abs(self.commands[env_ids, 1]) > self.cfg.commands.lin_vel_y_clip) | (torch.abs(self.commands[env_ids, 2]) > self.cfg.commands.ang_vel_yaw_clip)
+    #     self.commands[env_ids, :3] *= non_stop_sign.unsqueeze(1)
+
+    def control_ik(self, dpose):
+        # solve damped least squares
+        j_eef_T = torch.transpose(self.ee_j_eef, 1, 2)
+        lmbda = torch.eye(6, device=self.device) * (0.05 ** 2)
+        A = torch.bmm(self.ee_j_eef, j_eef_T) + lmbda[None, ...]
+        u = torch.bmm(j_eef_T, torch.linalg.solve(A, dpose))#.view(self.num_envs, 6)
+        return u.squeeze(-1)
+
+    def _resample_ee_goal_cart_once(self, env_ids):
+
+        # 现在只考虑食指,以后记得修改
+        rand_joint = torch.zeros((self.num_envs, self.num_dofs), device=self.device)
+        low  = self.dof_pos_limits[4:8, 0]  # shape: (4,)
+        high = self.dof_pos_limits[4:8, 1]  # shape: (4,)
+
+        rand_joint[env_ids, 4:8] = low + (high - low) * torch.rand((len(env_ids), 4), device=self.device)
+        self._pinocchio_forward_kinematics(rand_joint, env_ids)
+
+        # self.ee_goal_sphere[env_ids, 0] = torch_rand_float(self.goal_ee_ranges["pos_l"][0], self.goal_ee_ranges["pos_l"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        # self.ee_goal_sphere[env_ids, 1] = torch_rand_float(self.goal_ee_ranges["pos_p"][0], self.goal_ee_ranges["pos_p"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+        # self.ee_goal_sphere[env_ids, 2] = torch_rand_float(self.goal_ee_ranges["pos_y"][0], self.goal_ee_ranges["pos_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
+    
+    def _resample_ee_goal_orn_once(self, env_ids):
+        ee_goal_delta_orn_r = torch_rand_float(self.goal_ee_ranges["delta_orn_r"][0], self.goal_ee_ranges["delta_orn_r"][1], (len(env_ids), 1), device=self.device)
+        ee_goal_delta_orn_p = torch_rand_float(self.goal_ee_ranges["delta_orn_p"][0], self.goal_ee_ranges["delta_orn_p"][1], (len(env_ids), 1), device=self.device)
+        ee_goal_delta_orn_y = torch_rand_float(self.goal_ee_ranges["delta_orn_y"][0], self.goal_ee_ranges["delta_orn_y"][1], (len(env_ids), 1), device=self.device)
+        self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
+
+    def _resample_ee_goal(self, env_ids, is_init=False):
+        # if self.cfg.env.teleop_mode and is_init:
+        #     self.curr_ee_goal_sphere[:] = self.init_start_ee_sphere[:]
+        #     self.commands[:, INDEX_EE_POS_RADIUS_CMD:(INDEX_EE_POS_YAW_CMD+1)] = self.curr_ee_goal_sphere.view(self.num_envs,3)
+        #     return
+        # elif self.cfg.env.teleop_mode:
+        #     return
+
+        if len(env_ids) > 0:
+            init_env_ids = env_ids.clone()
+
+            # ee_local_cart = quat_rotate_inverse(self.base_yaw_quat, self.ee_pos - self.get_ee_goal_spherical_center())
+            #         # Spherical to cartesian coordinates in the arm base frame 
+            # radius = torch.norm(ee_local_cart, dim=1).view(self.num_envs,1)
+            # pitch = torch.asin(ee_local_cart[:,2].view(self.num_envs,1)/radius).view(self.num_envs,1)
+            # yaw = torch.atan2(ee_local_cart[:,1].view(self.num_envs,1), ee_local_cart[:,0].view(self.num_envs,1)).view(self.num_envs,1)
+            # ee_pos_sphe_arm = torch.cat((radius, pitch, yaw), dim=1).view(self.num_envs,3)
+            if is_init:
+                if self.global_steps < 0 * 24 and not self.play:
+                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                else:
+                    # self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    self.finger_tip_goal_cart[env_ids] = quat_rotate_inverse(
+                        self.base_quat[env_ids],self.rigid_state[env_ids,self.finger_tips_idx,:3].clone().squeeze(1) - self.base_pos[env_ids])
+                    
+                    # ⭐ 正确方法：四元数坐标转换（世界系 -> base系）
+                    # 不能用 quat_rotate_inverse（那是旋转向量的），要用四元数乘法
+                    finger_tip_quat_world = self.rigid_state[env_ids, self.finger_tips_idx, 3:7].clone().squeeze(1)
+                    finger_tip_quat_base = quat_mul(quat_conjugate(self.base_quat[env_ids]), finger_tip_quat_world)
+                    self.finger_tip_goal_orn[env_ids] = finger_tip_quat_base
+            else:
+                if self.global_steps < 0 * 24 and not self.play:
+                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                else:
+                    self.finger_tip_start_cart[env_ids] = self.finger_tip_goal_cart[env_ids].clone()
+                    self.finger_tip_start_orn[env_ids] = self.finger_tip_goal_orn[env_ids].clone()
+                    # for i in range(10):
+                    self._resample_ee_goal_cart_once(env_ids)
+                        # collision_mask = self.collision_check(env_ids)
+                        # env_ids = env_ids[collision_mask]
+                        # if len(env_ids) == 0:
+                        #     break
+            self.goal_timer[init_env_ids] = 0.0
+
+    def collision_check(self, env_ids):
+        ee_target_all_sphere = torch.lerp(self.ee_start_sphere[env_ids, ..., None], self.ee_goal_sphere[env_ids, ...,  None], self.collision_check_t).squeeze(-1)
+        ee_target_cart = sphere2cart(torch.permute(ee_target_all_sphere, (2, 0, 1)).reshape(-1, 3)).reshape(self.num_collision_check_samples, -1, 3)
+        collision_mask = torch.any(torch.logical_and(torch.all(ee_target_cart < self.collision_upper_limits, dim=-1), torch.all(ee_target_cart > self.collision_lower_limits, dim=-1)), dim=0)
+        underground_mask = torch.any(ee_target_cart[..., 2] < self.underground_limit, dim=0)
+        return collision_mask | underground_mask
+
+    def update_curr_ee_goal(self):
+        if not self.cfg.env.teleop_mode:
+            t = torch.clip(self.goal_timer / self.traj_timesteps, 0, 1)
+
+            # translation
+            self.curr_finger_tip_goal_cart[:] = torch.lerp(self.finger_tip_start_cart, self.finger_tip_goal_cart, t[:, None])
+            self.commands[:, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = self.curr_finger_tip_goal_cart.view(self.num_envs,3)
+            
+            # rotation
+            self.curr_finger_tip_goal_orn[:] = slerp_xyzw(self.finger_tip_start_orn, self.finger_tip_goal_orn, t[:, None])
+            self.commands[:, INDEX_TIP_ORIENTATION_X_CMD:(INDEX_TIP_ORIENTATION_W_CMD+1)] = self.curr_finger_tip_goal_orn.view(self.num_envs,4)
+
+        self.goal_timer += 1
+        resample_id = (self.goal_timer > self.traj_total_timesteps).nonzero(as_tuple=False).flatten()
+              
+        self._resample_ee_goal(resample_id)
+    
+
+    # def get_ee_goal_spherical_center(self):
+    #     center = torch.cat([self.root_states[:, :2], torch.zeros(self.num_envs, 1, device=self.device)], dim=1)
+    #     center = center + quat_apply(self.base_quat, self.ee_goal_center_offset)
+    #     return center
+    
+    def _reset_dofs(self, env_ids):
+        """ Resets DOF position and velocities of selected environmments
+        Positions are randomly selected within 0.5:1.5 x default positions.
+        Velocities are set to zero.
+
+        Args:
+            env_ids (List[int]): Environemnt ids
+        """
+        self.dof_pos[env_ids] = self.default_dof_pos
+        # self.dof_pos[env_ids, 4:8] = self.default_dof_pos[4:8] * torch_rand_float(0.5, 1.5, (len(env_ids), 4), device=self.device)
+         # 在关节限制范围内随机初始化灵巧手关节位置，而不是乘以因子（避免默认位置为0时无法随机化）
+        low = self.dof_pos_limits[4:8, 0]
+        high = self.dof_pos_limits[4:8, 1]
+        # 在[low + 0.1*(high-low), high - 0.1*(high-low)]范围内随机，避免初始化在极限位置
+        margin = 0.1 * (high - low)
+        self.dof_pos[env_ids, 4:8] = (low + margin) + (high - low - 2*margin) * torch.rand((len(env_ids), 4), device=self.device)
+        
+        
+        self.dof_vel[env_ids] = 0.
+
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(self.sim,
+                                              gymtorch.unwrap_tensor(self.dof_state),
+                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+   
+    # def _reset_root_states(self, env_ids):
+    #     """ Resets ROOT states position and velocities of selected environmments
+    #         Sets base position based on the curriculum
+    #         Selects randomized base velocities within -0.5:0.5 [m/s, rad/s]
+    #     Args:
+    #         env_ids (List[int]): Environemnt ids
+    #     """
+    #     # base position
+    #     if self.custom_origins:
+    #         self.root_states[env_ids] = self.base_init_state
+    #         self.root_states[env_ids, :3] += self.env_origins[env_ids]
+    #         self.root_states[env_ids, :2] += torch_rand_float(-1., 1., (len(env_ids), 2), device=self.device) # xy position within 1m of the center
+    #     else:
+    #         self.root_states[env_ids] = self.base_init_state
+    #         self.root_states[env_ids, :3] += self.env_origins[env_ids]
+        
+    #     # base orientation
+    #     rand_yaw = self.cfg.init_state.rand_yaw_range*torch_rand_float(-1, 1, (len(env_ids), 1), device=self.device).squeeze(1)
+    #     quat = quat_from_euler_xyz(0*rand_yaw, 0*rand_yaw, rand_yaw) 
+    #     self.root_states[env_ids, 3:7] = quat[:, :]  
+
+    #     # base velocities
+    #     self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (len(env_ids), 6), device=self.device) # [7:10]: lin vel, [10:13]: ang vel
+    #     env_ids_int32 = env_ids.to(dtype=torch.int32)
+    #     self.gym.set_actor_root_state_tensor_indexed(self.sim,
+    #                                                  gymtorch.unwrap_tensor(self.root_states),
+    #                                                  gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+
+    # def _push_robots(self):
+    #     """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
+    #     """
+    #     max_vel = self.cfg.domain_rand.max_push_vel_xy
+    #     self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
+    #     self.root_states[:, 7:9] = torch.where(
+    #         self.commands.sum(dim=1).unsqueeze(-1) == 0,
+    #         self.root_states[:, 7:9] * 2.5,
+    #         self.root_states[:, 7:9]
+    #     )
+    #     self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
+
+    def _push_finger_tip(self, env_ids_all):
+        """ Randomly pushes the finger tips. Emulates an impulse by setting a randomized finger tip velocity.
+        """
+
+        if self.cfg.commands.push_finger_tips:
+            # cmd force
+            # FORCE CONTROLLED ENVS
+            new_selected_env_ids_cmd = env_ids_all[(self.episode_length_buf % self.push_interval_finger_tips_cmd[:, 0]) == 0]
+            
+            # Define force and duration for the push 
+            if new_selected_env_ids_cmd.nelement() > 0:
+
+                self.freed_envs_finger_tips_cmd[new_selected_env_ids_cmd] = torch.rand(len(new_selected_env_ids_cmd), dtype=torch.float, device=self.device, requires_grad=False) > self.cfg.commands.finger_tips_forced_prob_cmd
+                min_force_cmd_x = self.cfg.commands.max_push_force_finger_tips_cmd_x[0]
+                max_force_cmd_x = self.cfg.commands.max_push_force_finger_tips_cmd_x[1]
+                min_force_cmd_y = self.cfg.commands.mam_push_force_finger_tips_cmd_y[0]
+                max_force_cmd_y = self.cfg.commands.mam_push_force_finger_tips_cmd_y[1]
+                min_force_cmd_z = self.cfg.commands.mam_push_force_finger_tips_cmd_z[0]
+                max_force_cmd_z = self.cfg.commands.mam_push_force_finger_tips_cmd_z[1]
+
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 0] = torch_rand_float(min_force_cmd_x, max_force_cmd_x, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 1] = torch_rand_float(min_force_cmd_y, max_force_cmd_y, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 2] = torch_rand_float(min_force_cmd_z, max_force_cmd_z, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+
+
+                push_duration_finger_tips_cmd = torch_rand_float(self.push_duration_finger_tips_cmd_min, self.push_duration_finger_tips_cmd_max, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd)) # 4.0/self.dt
+                push_duration_finger_tips_cmd = torch.clip(push_duration_finger_tips_cmd, max=(self.push_interval_finger_tips_cmd[new_selected_env_ids_cmd, 0] - self.settling_time_force_finger_tips)/2).to(self.device)
+                self.push_end_time_finger_tips_cmd[new_selected_env_ids_cmd] = self.episode_length_buf[new_selected_env_ids_cmd] + push_duration_finger_tips_cmd
+                self.push_duration_finger_tips_cmd[new_selected_env_ids_cmd] = push_duration_finger_tips_cmd
+
+                self.selected_env_ids_finger_tips_cmd[new_selected_env_ids_cmd] = 1
+                
+            # Get ids of all envs to apply a force to 
+            if self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1].nelement() > 0:
+                subset_env_ids_selected = env_ids_all[self.selected_env_ids_finger_tips_cmd == 1]
+
+                # Step 1: apply force from 0 to force_target_finger_tips_cmd
+                env_ids_apply_push_step1 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] < (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1]).type(torch.int32)]
+                # print(env_ids_apply_push_step1)
+                if env_ids_apply_push_step1.nelement() > 0:
+                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1)
+                    
+                    self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, :3] = (self.force_target_finger_tips_cmd[env_ids_apply_push_step1, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                    
+                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_X] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 0] #torch.norm(self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, :2], dim=1)
+                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_Y] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 1] #torch.atan2(self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, 1], self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, 0])
+                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_Z] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 2]
+ 
+                # Step 2: apply force from force_target_gripper_cmd back to 0
+                env_ids_apply_push_step2 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] > (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1] + self.settling_time_force_finger_tips).type(torch.int32)]
+                if env_ids_apply_push_step2.nelement() > 0:
+                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1)
+                    self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, :3] = self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :3] - (self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                
+                    # World frame
+                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_X] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 0] #torch.norm(self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, :2], dim=1)
+                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_Y] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 1] #torch.atan2(self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 1], self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 0])
+                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_Z] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 2]
+                    
+                # Reset the tensors
+                env_ids_to_reset = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] >= (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1] + self.settling_time_force_finger_tips + self.push_duration_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1]).type(torch.int32)]
+                if env_ids_to_reset.nelement() > 0:
+                    self.selected_env_ids_finger_tips_cmd[env_ids_to_reset] = 0
+                    self.force_target_finger_tips_cmd[env_ids_to_reset, :3] = 0.
+                    self.current_Fxyz_finger_tips_cmd[env_ids_to_reset, :3] = 0.
+                    self.push_end_time_finger_tips_cmd[env_ids_to_reset] = 0.
+                    self.push_duration_finger_tips_cmd[env_ids_to_reset] = 0.
+                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_X] = 0.0
+                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_Y] = 0.0
+                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_Z] = 0.0
+                    self.push_interval_finger_tips_cmd[env_ids_to_reset, 0] = torch.randint(int(self.push_interval_finger_tips_cmd_min), int(self.push_interval_finger_tips_cmd_max), (len(env_ids_to_reset), 1), device=self.device)[:, 0]
+                    
+            self.selected_env_ids_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0
+            self.force_target_finger_tips_cmd[self.freed_envs_finger_tips_cmd, :3] = 0.
+            self.current_Fxyz_finger_tips_cmd[self.freed_envs_finger_tips_cmd, :3] = 0.
+            self.push_end_time_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0.
+            self.push_duration_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0. 
+            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_X] = 0.0
+            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_Y] = 0.0
+            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_Z] = 0.0
+
+
+            # ext force
+            # FORCE CONTROLLED ENVS
+            new_selected_env_ids_ext = env_ids_all[(self.episode_length_buf % self.push_interval_finger_tips_ext[:, 0]) == 0]
+            
+            # Define force and duration for the push 
+            if new_selected_env_ids_ext.nelement() > 0:
+                
+                self.freed_envs_finger_tips_ext[new_selected_env_ids_ext] = torch.rand(len(new_selected_env_ids_ext), dtype=torch.float, device=self.device, requires_grad=False) > self.cfg.commands.finger_tips_forced_prob_ext
+                min_force_ext_x = self.cfg.commands.max_push_force_finger_tips_ext_x[0]
+                max_force_ext_x = self.cfg.commands.max_push_force_finger_tips_ext_x[1]
+                min_force_ext_y = self.cfg.commands.mam_push_force_finger_tips_ext_y[0]
+                max_force_ext_y = self.cfg.commands.mam_push_force_finger_tips_ext_y[1]
+                min_force_ext_z = self.cfg.commands.mam_push_force_finger_tips_ext_z[0]
+                max_force_ext_z = self.cfg.commands.mam_push_force_finger_tips_ext_z[1]
+
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 0] = torch_rand_float(min_force_ext_x, max_force_ext_x, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 1] = torch_rand_float(min_force_ext_y, max_force_ext_y, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 2] = torch_rand_float(min_force_ext_z, max_force_ext_z, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
+
+                
+                push_duration_finger_tips_ext = torch_rand_float(self.push_duration_finger_tips_ext_min, self.push_duration_finger_tips_ext_max, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext)) # 4.0/self.dt
+                push_duration_finger_tips_ext = torch.clip(push_duration_finger_tips_ext, max=(self.push_interval_finger_tips_ext[new_selected_env_ids_ext, 0] - self.settling_time_force_finger_tips)/2).to(self.device)
+                self.push_end_time_finger_tips_ext[new_selected_env_ids_ext] = self.episode_length_buf[new_selected_env_ids_ext] + push_duration_finger_tips_ext
+                self.push_duration_finger_tips_ext[new_selected_env_ids_ext] = push_duration_finger_tips_ext
+                
+                self.selected_env_ids_finger_tips_ext[new_selected_env_ids_ext] = 1
+                
+            # Get ids of all envs to apply a force to 
+            if self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1].nelement() > 0:
+                subset_env_ids_selected = env_ids_all[self.selected_env_ids_finger_tips_ext == 1]
+
+                # Step 1: apply force from 0 to force_target_finger_tips_cmd
+                env_ids_apply_push_step1 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] < (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1]).type(torch.int32)]
+                # print(env_ids_apply_push_step1)
+                if env_ids_apply_push_step1.nelement() > 0:
+                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1)
+                    
+                    self.forces[env_ids_apply_push_step1, self.finger_tips_idx, :3] = (self.force_target_finger_tips_ext[env_ids_apply_push_step1, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                  
+                # Step 2: apply force from force_target_finger_tips_cmd back to 0
+                env_ids_apply_push_step2 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] > (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1] + self.settling_time_force_finger_tips).type(torch.int32)]
+                if env_ids_apply_push_step2.nelement() > 0:
+                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1)
+                    
+                    # world frame
+                    self.forces[env_ids_apply_push_step2, self.finger_tips_idx, :3] = self.force_target_finger_tips_ext[env_ids_apply_push_step2, :3] - (self.force_target_finger_tips_ext[env_ids_apply_push_step2, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                
+                    
+                # Reset the tensors
+                env_ids_to_reset = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] >= (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1] + self.settling_time_force_finger_tips + self.push_duration_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1]).type(torch.int32)]                                        
+                if env_ids_to_reset.nelement() > 0:
+                    self.selected_env_ids_finger_tips_ext[env_ids_to_reset] = 0
+                    self.force_target_finger_tips_ext[env_ids_to_reset, :3] = 0.
+                    self.push_end_time_finger_tips_ext[env_ids_to_reset] = 0.
+                    self.push_duration_finger_tips_ext[env_ids_to_reset] = 0.
+                    self.push_interval_finger_tips_ext[env_ids_to_reset, 0] = torch.randint(int(self.push_interval_finger_tips_ext_min), int(self.push_interval_finger_tips_ext_max), (len(env_ids_to_reset), 1), device=self.device)[:, 0]
+                    
+            self.selected_env_ids_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0
+            self.force_target_finger_tips_ext[self.freed_envs_finger_tips_ext, :3] = 0.
+            self.push_end_time_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0.
+            self.push_duration_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0. 
+            
+            self.forces[self.freed_envs_finger_tips_ext, self.finger_tips_idx, :3] = 0
+
+            
+
+    def update_command_curriculum(self, env_ids):
+        """ Implements a curriculum of increasing commands
+
+        Args:
+            env_ids (List[int]): ids of environments being reset
+        """
+        # If the tracking reward is above 80% of the maximum, increase the range of commands
+        if torch.mean(self.episode_sums["tracking_lin_vel"][env_ids]) / self.max_episode_length > 0.8 * self.reward_scales["tracking_lin_vel"]:
+            self.command_ranges["lin_vel_x"][0] = np.clip(self.command_ranges["lin_vel_x"][0] - 0.5, -self.cfg.commands.max_curriculum, 0.)
+            self.command_ranges["lin_vel_x"][1] = np.clip(self.command_ranges["lin_vel_x"][1] + 0.5, 0., self.cfg.commands.max_curriculum)
+
+
+    def _get_noise_scale_vec(self, cfg):
+        """ Sets a vector used to scale the noise added to the observations.
+            [NOTE]: Must be adapted when changing the observations structure
+
+        Args:
+            cfg (Dict): Environment config file
+
+        Returns:
+            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
+        """
+        noise_vec = torch.zeros(
+            self.cfg.env.num_single_obs, device=self.device)
+        self.add_noise = self.cfg.noise.add_noise
+        noise_scales = self.cfg.noise.noise_scales
+        noise_level = self.cfg.noise.noise_level
+        # noise_vec[:2] = noise_scales.gravity * noise_level
+        # noise_vec[2:5] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        # noise_vec[5:5+self.num_actions] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        # noise_vec[5+self.num_actions:5+self.num_actions*2] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        # noise_vec[5+self.num_actions*2:5+self.num_actions*3] = 0. # previous actions
+        # noise_vec[5+self.num_actions*3:] = 0. # commands
+
+        return noise_vec
+
+    #----------------------------------------
+    def _init_buffers(self):
+        """ Initialize torch tensors which will contain simulation states and processed quantities
+        """
+
+        # get gym GPU state tensors
+        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+        dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+        net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
+        rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
+        force_tensor = self.gym.acquire_force_sensor_tensor(self.sim)
+
+
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_force_sensor_tensor(self.sim)
+
+        # create some wrapper tensors for different slices
+        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
+
+        self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
+        self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
+
+
+        self.base_quat = self.root_states[:, 3:7]
+        self.base_pos = self.root_states[:, :3]
+        self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
+
+        # base_yaw = euler_from_quat(self.base_quat)[2]
+        # self.base_yaw_euler = torch.cat([torch.zeros(self.num_envs, 2, device=self.device), base_yaw.view(-1, 1)], dim=1)
+        # self.base_yaw_quat = quat_from_euler_xyz(torch.tensor(0), torch.tensor(0), base_yaw)
+
+
+        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
+        self.rigid_state = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, -1, 13)
+        self.sensors_forces = gymtorch.wrap_tensor(force_tensor).view(self.num_envs, -1, 6)
+
+        # 记得添加其他sensor
+        self.sensors_world = torch.zeros(self.num_envs, 1, 7, device=self.device) # pos(3) + orn(4)
+        for i in range(1):
+            # breakpoint()
+            link_pos = self.rigid_state[:, self.finger_tips_idx,:3]
+            link_q = self.rigid_state[:, self.finger_tips_idx,3:7]
+            offset = self.sensors_pos_link[i, :3].view(1, 1, 3)   # (1,1,3)
+            offset = offset.expand_as(link_pos)     
+            self.sensors_world[:, i, :3] = (link_pos + offset).squeeze(1)            
+
+            q_rel = self.sensors_pos_link[i, 3:7].reshape(1, 1, 4)  # (1,1,4)
+            self.sensors_world[:, i, 3:7] = quat_mul(link_q , q_rel).squeeze(1)
+
+        # # ee info
+        self.finger_tips_pos = self.rigid_state[:, self.finger_tips_idx, :3]
+        self.finger_tips_orn = self.rigid_state[:, self.finger_tips_idx, 3:7]
+
+        self.grasp_offset = self.cfg.arm.grasp_offset
+
+        # target_ee info
+        self.traj_timesteps = torch_rand_float(self.cfg.goal_ee.traj_time[0], self.cfg.goal_ee.traj_time[1], (self.num_envs, 1), device=self.device).squeeze(1) / self.dt
+        self.traj_total_timesteps = self.traj_timesteps + torch_rand_float(self.cfg.goal_ee.hold_time[0], self.cfg.goal_ee.hold_time[1], (self.num_envs, 1), device=self.device).squeeze(1) / self.dt
+        self.goal_timer = torch.zeros(self.num_envs, device=self.device)
+
+        self.finger_tip_start_cart =torch.zeros(self.num_envs, 3, device=self.device)
+        self.finger_tip_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        self.curr_finger_tip_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        self.init_start_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_start, device=self.device,dtype = torch.float).unsqueeze(0)
+        self.init_end_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_end, device=self.device,dtype = torch.float).unsqueeze(0)
+
+        # x,y,z,ws (初始化为单位四元数 [0, 0, 0, 1])
+        self.finger_tip_start_orn = torch.zeros(self.num_envs, 4, device=self.device)
+        self.finger_tip_start_orn[:, 3] = 1.0  # w = 1
+        self.finger_tip_goal_orn = torch.zeros(self.num_envs, 4, device=self.device)
+        self.finger_tip_goal_orn[:, 3] = 1.0  # w = 1
+        self.curr_finger_tip_goal_orn = torch.zeros(self.num_envs, 4, device=self.device)
+        self.curr_finger_tip_goal_orn[:, 3] = 1.0  # w = 1
+        self.init_start_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).unsqueeze(0)
+        self.init_end_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).unsqueeze(0)
+        # self.curr_finger_tip_goal_cart = self.init_start_finger_tip_cart
+        # self.ee_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        # self.ee_goal_sphere = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # self.ee_goal_orn_euler = torch.zeros(self.num_envs, 3, device=self.device)
+        # self.ee_goal_orn_euler[:, 0] = np.pi / 2
+        # self.ee_goal_orn_quat = quat_from_euler_xyz(self.ee_goal_orn_euler[:, 0], self.ee_goal_orn_euler[:, 1], self.ee_goal_orn_euler[:, 2])
+        # self.ee_goal_orn_delta_rpy = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # self.curr_ee_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
+        # self.curr_ee_goal_sphere = torch.zeros(self.num_envs, 3, device=self.device)
+        # self.ee_pos_sphe_arm = torch.zeros(self.num_envs, 3, device=self.device)
+
+        # self.init_start_ee_sphere = torch.tensor(self.cfg.goal_ee.ranges.init_pos_start, device=self.device).unsqueeze(0)
+        # self.init_end_ee_sphere = torch.tensor(self.cfg.goal_ee.ranges.init_pos_end, device=self.device).unsqueeze(0)
+        self.collision_lower_limits = torch.tensor(self.cfg.goal_ee.collision_lower_limits, device=self.device, dtype=torch.float)
+        self.collision_upper_limits = torch.tensor(self.cfg.goal_ee.collision_upper_limits, device=self.device, dtype=torch.float)
+        self.underground_limit = self.cfg.goal_ee.underground_limit
+        self.num_collision_check_samples = self.cfg.goal_ee.num_collision_check_samples
+        self.collision_check_t = torch.linspace(0, 1, self.num_collision_check_samples, device=self.device)[None, None, :]
+        assert(self.cfg.goal_ee.command_mode in ['cart', 'sphere'])
+        # self.sphere_error_scale = torch.tensor(self.cfg.goal_ee.sphere_error_scale, device=self.device)
+        # self.orn_error_scale = torch.tensor(self.cfg.goal_ee.orn_error_scale, device=self.device)
+        # self.ee_goal_center_offset = torch.tensor([self.cfg.goal_ee.sphere_center.x_offset, 
+        #                                            self.cfg.goal_ee.sphere_center.y_offset, 
+        #                                            self.cfg.goal_ee.sphere_center.z_invariant_offset], 
+        #                                            device=self.device).repeat(self.num_envs, 1)
+        
+        # self.curr_ee_goal_cart_world = self.get_ee_goal_spherical_center() + quat_apply(self.base_yaw_quat, self.curr_ee_goal_cart)
+
+        # initialize some data used later on
+        self.gripper_force_kps = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.common_step_counter = 0
+        self.extras = {}
+        self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
+     
+        self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        self.last_rigid_state = torch.zeros_like(self.rigid_state)
+        self.last_dof_vel = torch.zeros_like(self.dof_vel)
+
+        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
+        # self.commands_scale = torch.tensor([self.obs_scales.lin_vel, 
+        #                                     self.obs_scales.lin_vel, 
+        #                                     self.obs_scales.ang_vel,
+        #                                     self.obs_scales.ee_sphe_radius_cmd, 
+        #                                     self.obs_scales.ee_sphe_pitch_cmd,
+        #                                     self.obs_scales.ee_sphe_yaw_cmd,
+        #                                     self.obs_scales.end_effector_roll_cmd, 
+        #                                     self.obs_scales.end_effector_pitch_cmd,
+        #                                     self.obs_scales.end_effector_yaw_cmd,
+        #                                     self.obs_scales.ee_force,
+        #                                     self.obs_scales.ee_force,
+        #                                     self.obs_scales.ee_force,
+        #                                     self.obs_scales.base_force,
+        #                                     self.obs_scales.base_force,
+        #                                     self.obs_scales.base_force,], device=self.device, requires_grad=False,) # TODO change this
+      
+        # 现在只考虑食指,以后记得修改
+        # rand_joint = torch.zeros((self.num_envs, self.num_dofs), device=self.device)
+        # low  = self.dof_pos_limits[4:8, 0]  # shape: (4,)
+        # high = self.dof_pos_limits[4:8, 1]  # shape: (4,)
+
+        # rand_joint[:, 4:8] = low + (high - low) * torch.rand((self.num_envs, 4), device=self.device)
+        # rand_joint[:,4] = 0.6
+        # self._pinocchio_forward_kinematics(rand_joint, torch.arange(self.num_envs, device=self.device))
+        # self.curr_finger_tip_goal_cart = self.finger_tip_goal_cart.clone()
+
+
+        self.obs_history = deque(maxlen=self.cfg.env.frame_stack)
+        self.critic_history = deque(maxlen=self.cfg.env.c_frame_stack)
+        for _ in range(self.cfg.env.frame_stack):
+            self.obs_history.append(torch.zeros(
+                self.num_envs, self.cfg.env.num_single_obs, dtype=torch.float, device=self.device))
+        for _ in range(self.cfg.env.c_frame_stack):
+            self.critic_history.append(torch.zeros(
+                self.num_envs, self.cfg.env.single_num_privileged_obs, dtype=torch.float, device=self.device))
+
+        # joint positions offsets and PD gains
+        self.default_dof_pos = 0.5* torch.ones(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+       
+        self.dof_pos_target = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+
+        # force control
+
+        # Push tip 
+        self.freed_envs_finger_tips_cmd = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.freed_envs_finger_tips_ext = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.selected_env_ids_finger_tips_cmd = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device, requires_grad=False)
+        self.selected_env_ids_finger_tips_ext = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device, requires_grad=False)
+
+
+        self.push_interval_finger_tips_cmd = torch.randint(int(self.push_interval_finger_tips_cmd_min), int(self.push_interval_finger_tips_cmd_max), (self.num_envs, 1), device=self.device, requires_grad=False)
+        self.push_interval_finger_tips_ext = torch.randint(int(self.push_interval_finger_tips_ext_min), int(self.push_interval_finger_tips_ext_max), (self.num_envs, 1), device=self.device, requires_grad=False)
+        self.push_end_time_finger_tips_cmd = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.push_duration_finger_tips_cmd = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.settling_time_force_finger_tips_s = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        self.push_end_time_finger_tips_ext = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.push_duration_finger_tips_ext = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.settling_time_force_finger_tips_ext_s = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+
+        #需要对外界表现出的力 现在只有食指
+        self.force_target_finger_tips_cmd = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.force_target_finger_tips_ext = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.current_Fxyz_finger_tips_cmd = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+
+        # 当前需要主动施加的外力
+        self.forces = torch.zeros(self.num_envs, self.num_bodies, 6, dtype=torch.float, device=self.device,
+                                   requires_grad=False)
+        # self.forces_local = torch.zeros(self.num_envs, self.num_bodies, 6, dtype=torch.float, device=self.device,
+        #                            requires_grad=False)
+
+        self.global_steps = 0
+
+        self.reward_logs = dict(    )
+
+    def _prepare_reward_function(self):
+        """ Prepares a list of reward functions, whcih will be called to compute the total reward.
+            Looks for self._reward_<REWARD_NAME>, where <REWARD_NAME> are names of all non zero reward scales in the cfg.
+        """
+        # remove zero scales + multiply non-zero ones by dt
+        for key in list(self.reward_scales.keys()):
+            scale = self.reward_scales[key]
+            if scale==0:
+                self.reward_scales.pop(key) 
+            else:
+                self.reward_scales[key] *= self.dt
+        # prepare list of functions
+        self.reward_functions = []
+        self.reward_names = []
+        for name, scale in self.reward_scales.items():
+            if name=="termination":
+                continue
+            self.reward_names.append(name)
+            name = '_reward_' + name
+            self.reward_functions.append(getattr(self, name))
+
+        # reward episode sums
+        self.episode_sums = {name: torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+                             for name in self.reward_scales.keys()}
+
+    def _create_ground_plane(self):
+        """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
+        """
+        plane_params = gymapi.PlaneParams()
+        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
+        plane_params.static_friction = self.cfg.terrain.static_friction
+        plane_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+        plane_params.restitution = self.cfg.terrain.restitution
+        self.gym.add_ground(self.sim, plane_params)
+
+    def _create_trimesh(self):
+        """ Adds a triangle mesh terrain to the simulation, sets parameters based on the cfg.
+            Very slow when horizontal_scale is small
+        """
+        tm_params = gymapi.TriangleMeshParams()
+        tm_params.nb_vertices = self.terrain.vertices.shape[0]
+        tm_params.nb_triangles = self.terrain.triangles.shape[0]
+
+        tm_params.transform.p.x = -self.terrain.cfg.border_size 
+        tm_params.transform.p.y = -self.terrain.cfg.border_size
+        tm_params.transform.p.z = 0.0
+        tm_params.static_friction = self.cfg.terrain.static_friction
+        tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+        tm_params.restitution = self.cfg.terrain.restitution
+        print("Adding trimesh to simulation...")
+        self.gym.add_triangle_mesh(self.sim, self.terrain.vertices.flatten(order='C'), self.terrain.triangles.flatten(order='C'), tm_params)  
+        print("Trimesh added")
+        self.height_samples = torch.tensor(self.terrain.heightsamples).view(self.terrain.tot_rows, self.terrain.tot_cols).to(self.device)
+
+    def _create_envs(self):
+        """ Creates environments:
+             1. loads the robot URDF/MJCF asset,
+             2. For each environment
+                2.1 creates the environment, 
+                2.2 calls DOF and Rigid shape properties callbacks,
+                2.3 create actor with these properties and add them to the env
+             3. Store indices of different bodies of the robot
+        """
+        asset_path = self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        asset_root = os.path.dirname(asset_path)
+        asset_file = os.path.basename(asset_path)
+
+        asset_options = gymapi.AssetOptions()
+        asset_options.default_dof_drive_mode = self.cfg.asset.default_dof_drive_mode
+        asset_options.collapse_fixed_joints = self.cfg.asset.collapse_fixed_joints
+        asset_options.replace_cylinder_with_capsule = self.cfg.asset.replace_cylinder_with_capsule
+        asset_options.flip_visual_attachments = self.cfg.asset.flip_visual_attachments
+        asset_options.fix_base_link = self.cfg.asset.fix_base_link
+        asset_options.density = self.cfg.asset.density
+        asset_options.angular_damping = self.cfg.asset.angular_damping
+        asset_options.linear_damping = self.cfg.asset.linear_damping
+        asset_options.max_angular_velocity = self.cfg.asset.max_angular_velocity
+        # asset_options.max_linear_velocity = self.cfg.asset.max_linear_velocity
+        asset_options.armature = self.cfg.asset.armature
+        asset_options.thickness = self.cfg.asset.thickness
+        asset_options.disable_gravity = self.cfg.asset.disable_gravity
+        asset_options.use_mesh_materials = True
+
+        robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        self.num_dof = self.gym.get_asset_dof_count(robot_asset)
+        self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
+        dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
+        rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
+
+        # pinocchio
+        mesh_dir = os.path.dirname(asset_path)
+        robot = RobotWrapper.BuildFromURDF(asset_path, mesh_dir)
+        self.pinocchio_model = robot.model
+        self.pinocchio_data = self.pinocchio_model.createData()
+        self.pinocchio_tips_idx = [
+                                    self.pinocchio_model.getFrameId("finger1_tip_link"),
+                                    self.pinocchio_model.getFrameId("finger2_tip_link"),
+                                    self.pinocchio_model.getFrameId("finger3_tip_link"),
+                                    self.pinocchio_model.getFrameId("finger4_tip_link"),
+                                    self.pinocchio_model.getFrameId("finger5_tip_link"),
+                                ]
+
+
+        # save body names from the asset
+        body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        self.body_names_to_idx = self.gym.get_asset_rigid_body_dict(robot_asset)
+        self.dof_names = self.gym.get_asset_dof_names(robot_asset)
+
+        # self.finger_tips_idx = [self.body_names_to_idx[i] for i in self.cfg.asset.finger_tip_name]
+        self.finger_tips_idx = [10]
+
+        self.robot_palm_idx = [index for index, body_name in enumerate(body_names) if body_name == "palm_link"][0]
+        self.num_bodies = len(body_names)
+        self.num_dofs = len(self.dof_names)
+
+        # feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+        # thigh_names = [s for s in body_names if self.cfg.asset.thigh_name in s]
+        penalized_contact_names = []
+        for name in self.cfg.asset.penalize_contacts_on:
+            penalized_contact_names.extend([s for s in body_names if name in s])
+        termination_contact_names = []
+        for name in self.cfg.asset.terminate_after_contacts_on:
+            termination_contact_names.extend([s for s in body_names if name in s])
+
+        # base_init_state_list = self.cfg.init_state.default_joint_pos
+        # self.base_init_state = to_torch(base_init_state_list, device=self.device, requires_grad=False)
+
+        self._get_env_origins()
+        env_lower = gymapi.Vec3(0., 0., 0.)
+        env_upper = gymapi.Vec3(0., 0., 0.)
+        self.actor_handles = []
+        self.envs = []
+        self.sensors_handle = [[] for _ in range(self.num_envs)]
+
+        self.sensors_pos_link = torch.zeros(len(self.finger_tips_idx), 7, dtype=torch.float32, device=self.device) # x,y,z,(x,y,z,w)
+        
+        ##这里记得写入其他的sensor
+        self.sensors_pos_link[0] = torch.tensor([0.,0.,0.,0,0,0,1], dtype=torch.float32, device=self.device)
+
+
+        self.env_frictions = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
+
+        self.mass_params_tensor = torch.zeros(self.num_envs, 22, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # add tactile sensor on the finger tip现在只有食指
+        for i,tips_idx in enumerate(self.finger_tips_idx):
+            p = gymapi.Vec3(self.sensors_pos_link[i][0], self.sensors_pos_link[i][1], self.sensors_pos_link[i][2])
+            q = gymapi.Quat(self.sensors_pos_link[i][3], self.sensors_pos_link[i][4], self.sensors_pos_link[i][5], self.sensors_pos_link[i][6])
+            sensor_pose = gymapi.Transform(
+                p=p,
+                r=q
+            )
+            sensor_props = gymapi.ForceSensorProperties()
+            sensor_props.use_world_frame = False
+            self.gym.create_asset_force_sensor(robot_asset, tips_idx, sensor_pose,sensor_props)
+        
+        for i in range(self.num_envs):
+
+            # create env instance
+            env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
+            start_pose = gymapi.Transform()
+            start_pose.p = gymapi.Vec3(self.env_origins[i, 0], self.env_origins[i, 1], self.env_origins[i, 2])
+
+            rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
+            self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
+            actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, self.cfg.asset.name, i, self.cfg.asset.self_collisions, 0)
+            dof_props = self._process_dof_props(dof_props_asset, i)
+            self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
+            body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
+            body_props, mass_params = self._process_rigid_body_props(body_props, i)
+            self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+
+
+            num_sensors = self.gym.get_actor_force_sensor_count(env_handle, actor_handle)
+            for sensor_idx in range(num_sensors):
+                sensor = self.gym.get_actor_force_sensor(env_handle, actor_handle, sensor_idx)
+                self.sensors_handle[i].append(sensor)
+            self.mass_params_tensor[i, :] = torch.from_numpy(mass_params).to(self.device)
+
+            self.envs.append(env_handle)
+            self.actor_handles.append(actor_handle)
+
+        # self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
+        # for i in range(len(feet_names)):
+        #     self.feet_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], feet_names[i])
+
+        # self.thigh_indices = torch.zeros(len(thigh_names), dtype=torch.long, device=self.device, requires_grad=False)
+        # for i in range(len(thigh_names)):
+        #     self.thigh_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], thigh_names[i])
+
+        self.penalised_contact_indices = torch.zeros(len(penalized_contact_names), dtype=torch.long, device=self.device, requires_grad=False)
+        for i in range(len(penalized_contact_names)):
+            self.penalised_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], penalized_contact_names[i])
+
+        self.termination_contact_indices = torch.zeros(len(termination_contact_names), dtype=torch.long, device=self.device, requires_grad=False)
+        for i in range(len(termination_contact_names)):
+            self.termination_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], termination_contact_names[i])
+
+
+        self.friction_coeffs_tensor = self.friction_coeffs.to(self.device).squeeze(-1)
+
+        # if self.cfg.domain_rand.randomize_motor:
+        #     self.motor_strength = torch.cat([
+        #             torch_rand_float(self.cfg.domain_rand.motor_strength_range[0], self.cfg.domain_rand.motor_strength_range[1], (self.num_envs, 20), device=self.device)
+        #         ], dim=1)
+        # else:
+        #     self.motor_strength = torch.ones(self.num_envs, self.num_joints, device=self.device)
+        
+        # hip_names = ["FR_hip_joint", "FL_hip_joint", "RR_hip_joint", "RL_hip_joint"]
+        # self.hip_indices = torch.zeros(len(hip_names), dtype=torch.long, device=self.device, requires_grad=False)
+        # for i, name in enumerate(hip_names):
+        #     self.hip_indices[i] = self.dof_names.index(name)
+
+    def _get_env_origins(self):
+        """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
+            Otherwise create a grid.
+        """
+        self.custom_origins = True
+        self.env_origins = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
+        # put robots at the origins defined by the terrain
+        max_init_level = self.cfg.terrain.max_init_terrain_level  # start from 0
+        if not self.cfg.terrain.curriculum: max_init_level = self.cfg.terrain.num_rows - 1
+        self.terrain_levels = torch.randint(0, max_init_level+1, (self.num_envs,), device=self.device)
+        self.terrain_types = torch.div(torch.arange(self.num_envs, device=self.device), (self.num_envs/self.cfg.terrain.num_cols), rounding_mode='floor').to(torch.long)
+        self.max_terrain_level = self.cfg.terrain.num_rows
+        self.terrain_origins = torch.from_numpy(self.terrain.env_origins).to(self.device).to(torch.float)
+        self.env_origins[:] = self.terrain_origins[self.terrain_levels, self.terrain_types]
+
+    def _parse_cfg(self, cfg):
+        # self.num_torques = self.cfg.env.num_torques
+        self.num_joints = self.cfg.env.num_joints
+        self.dt = self.cfg.control.decimation * self.sim_params.dt
+        self.obs_scales = self.cfg.normalization.obs_scales
+        self.reward_scales = class_to_dict(self.cfg.rewards.scales)
+        self.command_ranges = class_to_dict(self.cfg.commands.ranges)
+
+        # self.goal_ee_ranges = class_to_dict(self.cfg.goal_ee.ranges)
+     
+        if self.cfg.terrain.mesh_type not in ['heightfield', 'trimesh']:
+            self.cfg.terrain.curriculum = False
+        self.max_episode_length_s = self.cfg.env.episode_length_s
+        self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
+
+       
+        self.push_interval_finger_tips_cmd_min = np.ceil(self.cfg.commands.push_tip_interval_s_cmd[0] / self.dt)
+        self.push_interval_finger_tips_cmd_max = np.ceil(self.cfg.commands.push_tip_interval_s_cmd[1] / self.dt)
+        self.push_duration_finger_tips_cmd_min = np.ceil(self.cfg.commands.push_tip_duration_s_cmd[0] / self.dt)
+        self.push_duration_finger_tips_cmd_max = np.ceil(self.cfg.commands.push_tip_duration_s_cmd[1] / self.dt)
+        self.push_interval_finger_tips_ext_min = np.ceil(self.cfg.commands.push_tip_interval_s_ext[0] / self.dt)
+        self.push_interval_finger_tips_ext_max = np.ceil(self.cfg.commands.push_tip_interval_s_ext[1] / self.dt)
+        self.push_duration_finger_tips_ext_min = np.ceil(self.cfg.commands.push_tip_duration_s_ext[0] / self.dt)
+        self.push_duration_finger_tips_ext_max = np.ceil(self.cfg.commands.push_tip_duration_s_ext[1] / self.dt)
+        self.settling_time_force_finger_tips = np.ceil(self.cfg.commands.settling_time_force_finger_tips_s/ self.dt)
+        # self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
+       
+        
+        self.action_delay = self.cfg.env.action_delay
+
+        self.stop_update_goal = False
+
+    # def get_walking_cmd_mask(self, env_ids=None, return_all=False):
+    #     if env_ids is None:
+    #         env_ids = torch.arange(self.num_envs, device=self.device)
+    #     walking_mask0 = torch.abs(self.commands[env_ids, 0]) > self.cfg.commands.lin_vel_x_clip
+    #     walking_mask1 = torch.abs(self.commands[env_ids, 1]) > self.cfg.commands.lin_vel_y_clip
+    #     walking_mask2 = torch.abs(self.commands[env_ids, 2]) > self.cfg.commands.ang_vel_yaw_clip
+    #     walking_mask = walking_mask0 | walking_mask1 | walking_mask2
+
+    #     if return_all:
+    #         return walking_mask0, walking_mask1, walking_mask2, walking_mask
+    #     return walking_mask
+
+
+    def _pinocchio_forward_kinematics(self, q, env_ids=None):
+        if len(env_ids)==0 :
+            return 
+        for i in range(len(env_ids)):
+            idx = env_ids[i]
+            q_i = q[idx].cpu().double().numpy().reshape(-1)
+            pin.forwardKinematics(self.pinocchio_model, self.pinocchio_data, q_i)
+            pin.updateFramePlacements(self.pinocchio_model, self.pinocchio_data)
+
+            # 仅有食指
+            # translation
+            index_tip_goal_cart_base = self.pinocchio_data.oMf[self.pinocchio_tips_idx[1]].translation.copy()
+            self.finger_tip_goal_cart[idx] = torch.from_numpy(index_tip_goal_cart_base).to(self.device, dtype=torch.float32)
+            # rotation
+            index_tip_goal_rotation_base = self.pinocchio_data.oMf[self.pinocchio_tips_idx[1]].rotation.copy() # 3*3 matrix
+            R_tensor = torch.from_numpy(index_tip_goal_rotation_base).to(self.device, dtype=torch.float32)
+            R_tensor = R_tensor.unsqueeze(0)
+            index_tip_goal_orn_base = mat3x3_to_xyzw(R_tensor).squeeze(0)  # (1, 4) -> (4,)
+            self.finger_tip_goal_orn[idx] = index_tip_goal_orn_base 
+
+
+    # def compute_ref_state(self):
+    #     phase = self._get_phase()
+    #     sin_pos = torch.sin(2 * torch.pi * phase)
+    #     sin_pos_l = sin_pos.clone() + self.cfg.rewards.target_joint_pos_thd
+    #     sin_pos_r = sin_pos.clone() - self.cfg.rewards.target_joint_pos_thd
+    #     repeat_default_pos = self.default_dof_pos[:, :12].repeat(self.num_envs, 1)
+    #     # self.ref_dof_pos = torch.zeros_like(self.dof_pos)
+    #     self.ref_dof_pos = repeat_default_pos.clone()
+    #     scale_1 = self.cfg.rewards.target_joint_pos_scale / (1 - self.cfg.rewards.target_joint_pos_thd)
+    #     scale_2 = scale_1 * 2
+    #     # left foot stance phase set to default joint pos
+    #     sin_pos_l[sin_pos_l > 0] = sin_pos_l[sin_pos_l > 0] * (1 - self.cfg.rewards.target_joint_pos_thd) / (1 + self.cfg.rewards.target_joint_pos_thd) * 0.0
+    #     self.ref_dof_pos[:, 1] -= sin_pos_l * scale_1 # FL_thigh_joint
+    #     self.ref_dof_pos[:, 2] += sin_pos_l * scale_2 # FL_calf_joint
+    #     self.ref_dof_pos[:, 10] -= sin_pos_l * scale_1 # RR_thigh_joint
+    #     self.ref_dof_pos[:, 11] += sin_pos_l * scale_2 # RR_calf_joint
+
+    #     sin_pos_r[sin_pos_r < 0] = sin_pos_r[sin_pos_r < 0] * (1 - self.cfg.rewards.target_joint_pos_thd) / (1 + self.cfg.rewards.target_joint_pos_thd) * 0.0
+    #     self.ref_dof_pos[:, 4] += sin_pos_r * scale_1 # FR_thigh_joint
+    #     self.ref_dof_pos[:, 5] -= sin_pos_r * scale_2 # FR_calf_joint
+    #     self.ref_dof_pos[:, 7] += sin_pos_r * scale_1 # RL_thigh_joint
+    #     self.ref_dof_pos[:, 8] -= sin_pos_r * scale_2 # RL_calf_joint
+ 
+    def subscribe_viewer_keyboard_events(self):
+        super().subscribe_viewer_keyboard_events()
+        if self.cfg.env.teleop_mode:
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_W, "forward")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_S, "reverse")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_Z, "left")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_C, "right")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_A, "turn_left")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_D, "turn_right")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_Q, "stop_x")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_E, "stop_angular")
+            self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_E, "stop_y")
+
+    
+    def handle_viewer_action_event(self, evt):
+        super().handle_viewer_action_event(evt)
+
+        if evt.value <= 0:
+            return
+        
+        if evt.action == "stop_x":
+            self.commands[:, 0] = 0
+        elif evt.action == "forward":
+            self.commands[:, 0] += 0.1
+        elif evt.action == "reverse":
+            self.commands[:, 0] -= 0.1
+        
+        elif evt.action == "stop_y":
+            self.commands[:, 1] = 0
+        elif evt.action == "left":
+            self.commands[:, 1] += 0.1
+        elif evt.action == "right":
+            self.commands[:, 1] -= 0.1
+
+        if evt.action == "stop_angular":
+            self.commands[:, 2] = 0
+        if evt.action == "turn_left":
+            self.commands[:, 2] += 0.1
+        elif evt.action == "turn_right":
+            self.commands[:, 2] -= 0.1
+        # print(evt.action, self.commands)
+
+        
+
+    #------------ reward functions----------------
+    # def _reward_tracking_ee_world(self):
+
+    #     finger_tip_pos_base = quat_rotate_inverse(self.base_quat, self.finger_tips_pos-self.base_pos)
+    #     ee_pos_error = torch.sum(torch.abs(finger_tip_pos_base- self.curr_finger_tip_goal_cart), dim=1)
+    #     rew = torch.exp(-ee_pos_error/self.cfg.rewards.tracking_ee_sigma * 2)
+    #     return rew
+    
+    def _reward_tracking_ee_orientation_6d_base(self):
+        """
+        6D旋转追踪奖励（自适应参数版本）
+        
+        Args:
+            mat6d_ee: tensor of shape (num_envs, 6)  当前姿态的6D表示
+            mat6d_target: tensor of shape (num_envs, 6)  目标姿态的6D表示
+        
+        Returns:
+            reward: tensor of shape (num_envs,)  奖励值
+        """
+        # 获取当前指尖姿态（世界坐标系）
+        finger_tip_orn_quat_world = self.rigid_state[:, self.finger_tips_idx, 3:7].clone().squeeze(1)
+        # 转换到base坐标系
+        finger_tip_orn_quat_base = quat_mul(quat_conjugate(self.base_quat), finger_tip_orn_quat_world)
+        # 归一化四元数（防止NaN）
+        finger_tip_orn_quat_base = finger_tip_orn_quat_base / (torch.norm(finger_tip_orn_quat_base, dim=-1, keepdim=True) + 1e-8)
+        
+        # 获取目标姿态（已经在base坐标系）
+        curr_finger_tip_goal_quat_base = self.curr_finger_tip_goal_orn.clone()
+        # 归一化四元数（防止NaN）
+        curr_finger_tip_goal_quat_base = curr_finger_tip_goal_quat_base / (torch.norm(curr_finger_tip_goal_quat_base, dim=-1, keepdim=True) + 1e-8)
+        
+        # 转换为6D表示
+        mat6d_ee_base = quat_to_mat6d(finger_tip_orn_quat_base)
+        mat6d_target_base = quat_to_mat6d(curr_finger_tip_goal_quat_base)
+        
+        # 1. 计算6D误差的L2距离平方和
+        diff = torch.sum((mat6d_ee_base - mat6d_target_base)**2, dim=-1)
+        
+        # 2. 自适应阈值参数
+        # 6D误差的理论最大值约为4.0（两个单位向量完全相反时）
+        # 但实际中，合理的误差范围通常在 [0, 2.0] 之间
+        # 我们使用理论最大值的一部分作为自适应阈值
+        diff_max_theoretical = 4.0  # 理论最大值
+        diff_threshold_ratio = 0.1   # 阈值比例（可配置）
+        adaptive_threshold = diff_max_theoretical * diff_threshold_ratio  # 约0.4
+        
+        # 3. 自适应缩放因子（基于误差大小）
+        # 误差越小，sigma越小（奖励曲线更陡），鼓励精确贴合
+        # 误差越大，sigma越大（奖励曲线更平缓），避免过度惩罚
+        # sigma_scale 范围: [0.3, 1.0]
+        # - diff → 0 时，sigma_scale → 0.3（最小sigma，最陡曲线）
+        # - diff → ∞ 时，sigma_scale → 1.0（最大sigma，最平缓曲线）
+        sigma_scale = 0.3 + 0.7 * (diff / (diff + adaptive_threshold))
+        
+        # 4. 自适应sigma值
+        # 与位置追踪奖励保持一致的形式
+        base_sigma = self.cfg.rewards.tracking_ee_orn_sigma
+        # sigma范围: [base_sigma * 0.3, base_sigma * 1.0]
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3, max=base_sigma * 1.0)
+        
+        rew = torch.exp(-adaptive_sigma * diff)
+        return rew
+
+    def _reward_tracking_ee_force_base(self):
+        forces_local = self.sensors_forces[:, 0, :3]
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
+        forces_offset_local = (forces_local + forces_cmd_local)
+
+        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1), forces_offset_local)
+        # forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(self.base_quat, forces_offset_global)
+
+
+        curr_ee_goal_cart_base_offset = forces_offset_base / self.gripper_force_kps + self.curr_finger_tip_goal_cart
+       
+        finger_tip_pos_world = self.rigid_state[:,self.finger_tips_idx, :3].clone().squeeze(1)
+        finger_tip_pos_base = quat_rotate_inverse(self.base_quat, finger_tip_pos_world-self.base_pos)
+
+        ee_pos_error = torch.sum(torch.abs(finger_tip_pos_base.squeeze(1) - curr_ee_goal_cart_base_offset), dim=1)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.tracking_ee_sigma
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error / (ee_pos_error + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error / (adaptive_sigma + 1e-6) * 2)
+        return rew
+    
+    # def _reward_tracking_ee_force(self):
+    #     """纯力跟踪奖励"""
+    #     force_error = torch.norm(
+    #         self.sensors_forces[:, 0, :3] - self.commands[:, INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)],
+    #         dim=1
+    #     )
+    #     return torch.exp(-force_error / 5.0)  # 5N误差衰减
+
+    def _reward_dof_vel(self):
+        # Penalize dof velocities
+        return torch.sum(torch.square(self.dof_vel)[:, 4:8], dim=1)
+
+    def _reward_contact_stability(self):
+        """接触稳定性（力的方向稳定性）"""
+        force_norm = torch.norm(self.sensors_forces[:, 0, :3], dim=1, keepdim=True) + 1e-6
+        force_direction = self.sensors_forces[:, 0, :3] / force_norm
+        
+        if not hasattr(self, 'last_force_direction'):
+            self.last_force_direction = force_direction.clone()
+        
+        direction_change = torch.norm(force_direction - self.last_force_direction, dim=1)
+        self.last_force_direction = force_direction.clone()
+        return torch.exp(-direction_change / 0.2)
+   
+    
+    def _reward_dof_acc(self):
+        # Penalize dof accelerations
+        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel)[:, 4:8] / self.dt), dim=1)
+    
+   
+    # def _reward_action_rate(self):
+    #     # Penalize changes in actions
+    #     return torch.sum(torch.square(self.last_actions - self.actions)[:, 4:8], dim=1)
+    
+    
+    def _reward_dof_pos_limits(self):
+        # Penalize dof positions too close to the limit
+        out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.) # lower limit
+        out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.)
+        return torch.sum(out_of_limits[:,4:8], dim=1)
+
+    def _reward_dof_vel_limits(self):
+        # Penalize dof velocities too close to the limit
+        # clip to max error = 1 rad/s per joint to avoid huge penalties
+        return torch.sum((torch.abs(self.dof_vel) - self.dof_vel_limits*self.cfg.rewards.soft_dof_vel_limit).clip(min=0., max=1.)[:, 4:8], dim=1)
+
+   
+    
+    def _reward_action_smoothness(self):
+        """
+        Encourages smoothness in the robot's actions by penalizing large differences between consecutive actions.
+        This is important for achieving fluid motion and reducing mechanical stress.
+        """
+        
+        term_1 = torch.sum(torch.square(
+            self.last_actions - self.actions)[:, 4:8], dim=1)
+        term_2 = torch.sum(torch.square(
+            self.actions + self.last_last_actions - 2 * self.last_actions)[:, 4:8], dim=1)
+        term_3 = 0.05 * torch.sum(torch.abs(self.actions)[:, 4:8], dim=1)
+        return term_1 + term_2 + term_3
+    
+    
+    def _reward_ee_force_x(self):
+        
+        xy_forces_local = self.forces[:, self.finger_tips_idx, 0:3]
+        
+        force_magn_meas = (xy_forces_local[:, 0]).view(self.num_envs, 1)
+        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_X]).view(self.num_envs, 1)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
+
+        force_magn_coeff = self.cfg.rewards.sigma_force
+        return torch.exp(-force_magn_coeff*force_magn_error)
+    
+    def _reward_ee_force_y(self):
+        
+        xy_forces_local = self.forces[:, self.finger_tips_idx, 0:3]
+        # base_quat_world = self.base_quat.view(self.num_envs,4)
+        # base_rpy_world = torch.stack(get_euler_xyz(base_quat_world), dim=1)
+        # base_quat_world_indep = quat_from_euler_xyz(0 * base_rpy_world[:, 0], 0 * base_rpy_world[:, 1], base_rpy_world[:, 2])
+        # xy_forces_local = quat_rotate_inverse(base_quat_world_indep, xy_forces_global)
+
+        force_magn_meas = (xy_forces_local[:, 1]).view(self.num_envs, 1)
+        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_Y]).view(self.num_envs, 1)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
+
+        force_magn_coeff = self.cfg.rewards.sigma_force
+        return torch.exp(-force_magn_coeff*force_magn_error)
+    
+    def _reward_ee_force_z(self):
+
+        force_magn_meas = (self.forces[:, self.finger_tips_idx, 2]).view(self.num_envs, 1)
+        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_Z]).view(self.num_envs, 1)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
+
+        force_magn_coeff = self.cfg.rewards.sigma_force
+        return torch.exp(-force_magn_coeff*force_magn_error)

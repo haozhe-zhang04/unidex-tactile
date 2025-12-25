@@ -3,7 +3,7 @@ import pinocchio as pin
 import numpy as np
 import os
 import torch
-from pytorch3d.transforms import quaternion_slerp
+
 # 旋转矩阵转换为四元数
 def mat3x3_to_quat(R):
     """
@@ -77,7 +77,11 @@ print("nv:", model.nv)
 
 # create q
 q = pin.neutral(model)
-q = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+q = np.array([0, 0, 0, 0, 
+                0, 0, 0, 0, 
+                0, 0,0, 0, 
+                0, 0, 0, 0, 
+                1.64, 0, 1.63, 0])
 print(q)
 # run fk
 pin.forwardKinematics(model, data, q)
@@ -96,6 +100,5 @@ for name in tip_names:
     fid = model.getFrameId(name)
     pos = data.oMf[fid].translation
     orn = data.oMf[fid].rotation
-    quat = mat3x3_to_quat(torch.tensor(orn))
-    quat = quaternion_slerp(quat, quat, 0.5)
-    print(name, pos, quat.numpy())
+    print(name, pos)
+    print(orn)

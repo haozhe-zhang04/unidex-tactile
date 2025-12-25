@@ -9,7 +9,8 @@ from isaacgym import gymtorch, gymapi, gymutil
 
 from collections import deque
 import torch
-from torch import Tensor
+import torch.nn.functional as F
+
 from typing import Tuple, Dict
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
@@ -26,7 +27,8 @@ import pinocchio as pin
 import numpy as np
 
 
-
+# 手指力控制索引
+# finger1
 INDEX_TIP_FORCE_X = 0
 INDEX_TIP_FORCE_Y = 1
 INDEX_TIP_FORCE_Z = 2
@@ -41,6 +43,7 @@ INDEX_TIP_ORIENTATION_Y_CMD = 10
 INDEX_TIP_ORIENTATION_Z_CMD = 11
 INDEX_TIP_ORIENTATION_W_CMD = 12
 
+
 def quat_to_rotation_matrix(quat):
     """
     将四元数转换为旋转矩阵 (GPU优化版本)
@@ -50,8 +53,9 @@ def quat_to_rotation_matrix(quat):
     Returns:
         R: tensor of shape (..., 3, 3)  旋转矩阵
     """
-    # 归一化四元数
-    quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
+    # 使用 F.normalize 替代手动归一化
+    # p=2 表示 2-范数（欧几里得长度），dim=-1 表示对最后一个维度（xyzw）做归一化
+    quat = F.normalize(quat, p=2, dim=-1)
     
     x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
     
@@ -66,7 +70,7 @@ def quat_to_rotation_matrix(quat):
         torch.stack([2*(xy + zw), 1 - 2*(xx + zz), 2*(yz - xw)], dim=-1),
         torch.stack([2*(xz - yw), 2*(yz + xw), 1 - 2*(xx + yy)], dim=-1),
     ], dim=-2)
-    
+    assert R.dim() == 4 and R.shape[1:] == (5, 3, 3)
     return R
     
 def get_euler_xyz_tensor(quat):
@@ -76,40 +80,40 @@ def get_euler_xyz_tensor(quat):
     euler_xyz[euler_xyz > np.pi] -= 2 * np.pi
     return euler_xyz
 
-def quat_conjugate(quat):
-    """
-    计算四元数的共轭
+# def quat_conjugate(quat):
+#     """
+#     计算四元数的共轭
     
-    Args:
-        quat: tensor of shape (..., 4)  四元数 [x, y, z, w]
-    Returns:
-        quat_conj: tensor of shape (..., 4)  共轭四元数 [-x, -y, -z, w]
-    """
-    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
-    return torch.stack([-x, -y, -z, w], dim=-1)
+#     Args:
+#         quat: tensor of shape (..., 4)  四元数 [x, y, z, w]
+#     Returns:
+#         quat_conj: tensor of shape (..., 4)  共轭四元数 [-x, -y, -z, w]
+#     """
+#     x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+#     return torch.stack([-x, -y, -z, w], dim=-1)
 
-def quat_mul(q1, q2):
-    """
-    批量四元数乘法 (Hamilton product)
+# def quat_mul(q1, q2):
+#     """
+#     批量四元数乘法 (Hamilton product)
     
-    Args:
-        q1: tensor of shape (..., 4)  四元数 [x, y, z, w]
-        q2: tensor of shape (..., 4)  四元数 [x, y, z, w]
+#     Args:
+#         q1: tensor of shape (..., 4)  四元数 [x, y, z, w]
+#         q2: tensor of shape (..., 4)  四元数 [x, y, z, w]
 
-    Returns:
-        q: tensor of shape (..., 4)  四元数乘积 q = q1 * q2
-    """
-    assert q1.shape[-1] == 4 and q2.shape[-1] == 4, "输入最后一维必须是4"
+#     Returns:
+#         q: tensor of shape (..., 4)  四元数乘积 q = q1 * q2
+#     """
+#     assert q1.shape[-1] == 4 and q2.shape[-1] == 4, "输入最后一维必须是4"
 
-    x1, y1, z1, w1 = q1.unbind(-1)
-    x2, y2, z2, w2 = q2.unbind(-1)
+#     x1, y1, z1, w1 = q1.unbind(-1)
+#     x2, y2, z2, w2 = q2.unbind(-1)
 
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+#     x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+#     y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+#     z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+#     w = w1*w2 - x1*x2 - y1*y2 - z1*z2
 
-    return torch.stack([x, y, z, w], dim=-1)
+#     return torch.stack([x, y, z, w], dim=-1)
 
 def mat3x3_to_xyzw(R):
     """
@@ -232,16 +236,19 @@ def slerp_xyzw(q0, q1, t, eps=1e-6):
 
 # 四元数转换为旋转矩阵前6维
 def quat_to_mat6d(quat):
-    rot_matrices = quat_to_rotation_matrix(quat) 
+
+    assert quat.dim() == 3 and quat.shape[1:] == (5, 4)
+    rot_matrices = quat_to_rotation_matrix(quat) # shape: (num_envs, num_fingers, 3, 3)
     
     # 2. 提取前两列
-    # col1: X轴方向 (num_envs, 3)
-    col1 = rot_matrices[:, :, 0] 
-    # col2: Y轴方向 (num_envs, 3)
-    col2 = rot_matrices[:, :, 1]
+    # col1: X轴方向 (num_envs, num_fingers, 3)
+    col1 = rot_matrices[:, :, :, 0] 
+    # col2: Y轴方向 (num_envs, num_fingers, 3)
+    col2 = rot_matrices[:, :, :, 1]
     
-    # 3. 拼接成 6D 向量 (num_envs, 6)
+    # 3. 拼接成 6D 向量 (num_envs, num_fingers, 6)
     mat6d = torch.cat([col1, col2], dim=-1)
+    assert mat6d.dim() == 3 and mat6d.shape[1:] == (5, 6)
     return mat6d
 
 class WujiRobot_pos_force(BaseTask):
@@ -297,25 +304,36 @@ class WujiRobot_pos_force(BaseTask):
         # actions为 delta action
         for _ in range(self.cfg.control.decimation):
             if self.cfg.control.use_delta_action:
-                self.dof_pos_target[:,4:8] = self.actions[:,:4] * self.cfg.control.action_scale + self.dof_pos[:,4:8]
+                self.dof_pos_target[:,:] = self.actions[:,:] * self.cfg.control.action_scale + self.dof_pos[:,:]
 
             else:
                 # 绝对位置控制
-                self.dof_pos_target[:,4:8] = self.actions[:,:4] * self.cfg.control.action_scale + self.default_dof_pos[4:8].unsqueeze(0)
-
+                self.dof_pos_target[:,:] = self.actions[:,:] * self.cfg.control.action_scale + self.default_dof_pos[:].unsqueeze(0)
+ 
             # ⭐ 关键：裁剪到关节限制范围内
-            self.dof_pos_target[:,4:8] = torch.clamp(
-                self.dof_pos_target[:,4:8],
-                self.dof_pos_limits[4:8, 0],  # lower limits
-                self.dof_pos_limits[4:8, 1]   # upper limits
+            self.dof_pos_target[:,:] = torch.clamp(
+                self.dof_pos_target[:,:],
+                self.dof_pos_limits[:,0],  # lower limits
+                self.dof_pos_limits[:,1],   # upper limits
             )      
 
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
 
             if self.global_steps > self.cfg.commands.force_start_step * 24:
                 self._push_finger_tip(torch.arange(self.num_envs, device=self.device))  
+            
 
-            self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces[:,:,:3].reshape(-1, 3).contiguous()), None, gymapi.LOCAL_SPACE)
+            # DEBUG
+            # 实时记录 self.forces[0,1,0:3] 的值
+            if self.enable_realtime_plot and _ == 0:  # 只在第一个 decimation step 记录
+                forces_xyz = self.forces[0, self.finger_tips_idx[2], 0:3].cpu().clone().numpy()
+                self.forces_history.append(forces_xyz)
+                self.step_history.append(self.global_steps)
+
+            is_apply_ext = self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces[:,:,:3].contiguous()), None, gymapi.LOCAL_SPACE)
+            
+            if not is_apply_ext:
+                raise Exception("Failed to apply external force to fingers")
             self.gym.simulate(self.sim)
             self.gym.refresh_dof_state_tensor(self.sim)
         # for _ in range(self.cfg.control.decimation):
@@ -342,6 +360,14 @@ class WujiRobot_pos_force(BaseTask):
 
         # return clipped obs, clipped states (None), rewards, dones and infos
         clip_obs = self.cfg.normalization.clip_observations
+        
+        # ⚠️ 诊断：检查 clip 前的值，如果经常被 clip 说明 normalization 有问题
+        if self.global_steps % 500 == 0:
+            obs_max_before_clip = self.obs_buf.abs().max().item()
+            obs_mean_before_clip = self.obs_buf.abs().mean().item()
+            if obs_max_before_clip > clip_obs * 0.9:  # 如果最大值接近 clip 阈值
+                print(f"Warning: obs_buf values near clip limit. Max abs: {obs_max_before_clip:.4f}, Mean abs: {obs_mean_before_clip:.4f}, Clip: {clip_obs}")
+        
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         self.obs_pred = torch.clip(self.obs_pred, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
@@ -375,6 +401,7 @@ class WujiRobot_pos_force(BaseTask):
         self.check_termination()
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+
         self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
@@ -383,36 +410,33 @@ class WujiRobot_pos_force(BaseTask):
         self.last_dof_vel[:] = self.dof_vel[:]
         self.last_rigid_state[:] = self.rigid_state[:]
 
-        # 更新传感器的世界坐标
-        for i in range(1):
-            # breakpoint()
-            link_pos = self.rigid_state[:, self.finger_tips_idx,:3].clone()
-            link_q = self.rigid_state[:, self.finger_tips_idx,3:7].clone()
-            offset = self.sensors_pos_link[i, :3].view(1, 1, 3)   # (1,1,3)
-            offset = offset.expand_as(link_pos)     
-            self.sensors_world[:, i, :3] = (link_pos + offset).squeeze(1)            
 
-            q_rel = self.sensors_pos_link[i, 3:7].reshape(1, 1, 4)  # (1,1,4)
-            self.sensors_world[:, i, 3:7] = quat_mul(link_q , q_rel).squeeze(1)
+    
+        # link_pos = self.rigid_state[:, self.finger_tips_idx,:3].clone()
+        # link_q = self.rigid_state[:, self.finger_tips_idx,3:7].clone()
+        # offset = self.sensors_pos_link[:, :3].view(1, 5, 3)   # (1,1,3)
+        # offset = offset.expand_as(link_pos)     
+        # # self.sensors_world[:, :, :3] = (link_pos + offset)       
+
+        # q_rel = self.sensors_pos_link[:, 3:7].reshape(1,5, 4)  # (1,1,4)
+        # self.sensors_world[:, :, 3:7] = quat_mul(link_q , q_rel)
         if self.viewer and self.enable_viewer_sync and self.debug_viz:
             self.gym.clear_lines(self.viewer)
         #     # self._draw_debug_vis()
         #     self.gym.clear_lines(self.viewer)
             self._draw_ee_goal_curr()
-            self._draw_ee()
-        #     self._draw_ee_goal_traj()
-        #     self._draw_collision_bbox()
-            # self._draw_ee_force()
-        #     self._draw_base_force()
-        #     self._draw_curve()
+            self._draw_ee_force()
+            # self._draw_ee()
+
 
     def _draw_ee(self):
         sphere_geom = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(1, 1, 0))
         # 直接从 rigid_state 读取最新位置
         finger_tip_pos_world = self.rigid_state[:, self.finger_tips_idx, :3].clone().squeeze(1)
         for i in range(self.num_envs):
-            sphere_pose = gymapi.Transform(gymapi.Vec3(finger_tip_pos_world[i, 0], finger_tip_pos_world[i, 1], finger_tip_pos_world[i, 2]), r=None)
-            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
+            for idx in range(len(self.finger_tips_idx)):
+                sphere_pose = gymapi.Transform(gymapi.Vec3(finger_tip_pos_world[i, idx, 0], finger_tip_pos_world[i, idx, 1], finger_tip_pos_world[i, idx, 2]), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose)
     
     def check_termination(self):
         """ Check if environments need to be reset
@@ -456,24 +480,24 @@ class WujiRobot_pos_force(BaseTask):
         self.goal_timer[env_ids] = 0.
 
         # force control
-        self.forces[env_ids, self.finger_tips_idx, :3] = 0.
+        self.forces[env_ids[:, None], self.finger_tips_idx, :3] = 0.
         self.selected_env_ids_finger_tips_cmd[env_ids] = 0
         self.selected_env_ids_finger_tips_ext[env_ids] = 0
         self.push_end_time_finger_tips_cmd[env_ids] = 0.
         self.force_target_finger_tips_cmd[env_ids, :3] = 0.
         self.force_target_finger_tips_ext[env_ids, :3] = 0.
         self.push_duration_finger_tips_cmd[env_ids] = 0.
-        self.current_Fxyz_finger_tips_cmd[env_ids, :3] = 0.
+        self.current_Fxyz_finger_tips_cmd_local[env_ids, :3] = 0.
 
 
-        self.commands[env_ids, INDEX_TIP_FORCE_X] = 0.0
-        self.commands[env_ids, INDEX_TIP_FORCE_Y] = 0.0
-        self.commands[env_ids, INDEX_TIP_FORCE_Z] = 0.0
+        self.commands[env_ids, :,INDEX_TIP_FORCE_X] = 0.0
+        self.commands[env_ids, :,INDEX_TIP_FORCE_Y] = 0.0
+        self.commands[env_ids, :,INDEX_TIP_FORCE_Z] = 0.0
 
 
         # Reset push gripper 
         if self.cfg.commands.push_finger_tips:
-            self.forces[env_ids, self.finger_tips_idx, :3] = 0.
+            self.forces[env_ids[:, None], self.finger_tips_idx, :3] = 0.
             self.selected_env_ids_finger_tips_cmd[env_ids] = 0
             self.selected_env_ids_finger_tips_ext[env_ids] = 0
             self.push_end_time_finger_tips_cmd[env_ids] = 0.
@@ -506,7 +530,8 @@ class WujiRobot_pos_force(BaseTask):
             name = self.reward_names[i]
             rew = self.reward_functions[i]() * self.reward_scales[name]
             self.rew_buf += rew
-            self.reward_logs[name]=rew
+            self.reward_logs[name]=rew  
+            self.episode_sums[name] += rew  # ⚠️ 关键修复：累加到 episode_sums
 
         if self.cfg.rewards.only_positive_rewards:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.)
@@ -515,7 +540,11 @@ class WujiRobot_pos_force(BaseTask):
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
-    
+         # 添加诊断信息
+        if self.global_steps % 100 == 0:
+            print(f"Reward stats: mean={self.rew_buf.mean():.4f}, std={self.rew_buf.std():.4f}, "
+                f"min={self.rew_buf.min():.4f}, max={self.rew_buf.max():.4f}")
+        
     def get_body_orientation(self, return_yaw=False):
         r, p, y = euler_from_quat(self.base_quat)
         body_angles = torch.stack([r, p, y], dim=-1)
@@ -528,119 +557,137 @@ class WujiRobot_pos_force(BaseTask):
     def compute_observations(self):
         """ Computes observations
         """
-
+        num_fingers = len(self.finger_tips_idx)
+        base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4).reshape(self.num_envs*num_fingers,4)
+        base_pos_reshaped = self.base_pos.unsqueeze(1).expand(self.num_envs, num_fingers, 3)
         # finger_tip_pos
-        finger_tip_pos_world = self.rigid_state[:,self.finger_tips_idx, :3].clone().squeeze(1)
-        finger_tip_pos_base = quat_rotate_inverse(self.base_quat, finger_tip_pos_world - self.base_pos)
+        finger_tip_pos_world = self.rigid_state[:,self.finger_tips_idx, :3].clone() # shape: (num_envs, num_fingers, 3)
+        finger_tip_pos_base = quat_rotate_inverse(base_quat_reshaped, (finger_tip_pos_world - base_pos_reshaped).reshape(-1,3)).reshape(self.num_envs,num_fingers,3)
         # finger_tip_orn
-        finger_tip_orn_quat_world = self.rigid_state[:,self.finger_tips_idx, 3:7].clone().squeeze(1)
-        finger_tip_orn_quat_base = quat_mul(quat_conjugate(self.base_quat), finger_tip_orn_quat_world)
-        # 归一化四元数（防止NaN）
-        finger_tip_orn_quat_base = finger_tip_orn_quat_base / (torch.norm(finger_tip_orn_quat_base, dim=-1, keepdim=True) + 1e-8)
+        finger_tip_orn_quat_world = self.rigid_state[:,self.finger_tips_idx, 3:7].clone()
+        finger_tip_orn_quat_base = quat_mul(quat_conjugate(base_quat_reshaped), finger_tip_orn_quat_world.reshape(-1,4)).reshape(self.num_envs,num_fingers,4) # shape: (num_envs, num_fingers, 4)
+
+
         finger_tip_orn_6d_base = quat_to_mat6d(finger_tip_orn_quat_base)
+
+        # # ⚠️ 关键修复：裁剪6D表示到合理范围，避免异常值
+        # finger_tip_orn_6d_base = torch.clamp(finger_tip_orn_6d_base, min=-2.0, max=2.0)
+
         # finger_tip_vel
-        finger_tip_vel_world = self.rigid_state[:,self.finger_tips_idx, 7:10].clone().squeeze(1)
-        finger_tip_vel_base = quat_rotate_inverse(self.base_quat, finger_tip_vel_world)
+        finger_tip_vel_world = self.rigid_state[:,self.finger_tips_idx, 7:10].clone()
+        finger_tip_vel_base = quat_rotate_inverse(base_quat_reshaped, finger_tip_vel_world.reshape(-1,3)).reshape(self.num_envs,num_fingers,3)
 
         # force+pos
-        forces_local = self.sensors_forces[:, 0, :3]
-        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
+        forces_local = self.forces[:, self.finger_tips_idx, :3].clone() # 手动施加的外力
+        forces_base = self.transform_force_finger_tip_local_to_base(forces_local)
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local
         forces_offset_local = (forces_local + forces_cmd_local)
 
-        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1), forces_offset_local)
+        forces_offset_base = self.transform_force_finger_tip_local_to_base(forces_offset_local)
 
-        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
-        curr_finger_tip_goal_cart_base = quat_rotate_inverse(self.base_quat,curr_ee_goal_cart_world_offset)
+        # 计算考虑力偏移的目标位置 shape: (num_envs, num_fingers, 3)
+        curr_finger_tip_goal_cart_base = forces_offset_base / (self.gripper_force_kps) + self.curr_finger_tip_goal_cart
 
         # error
         finger_tip_pos_error = finger_tip_pos_base - curr_finger_tip_goal_cart_base
 
-        # 归一化目标姿态四元数（防止NaN）
+        # ⚠️ 关键修复：确保目标姿态四元数归一化
         curr_finger_tip_goal_orn_normalized = self.curr_finger_tip_goal_orn / (torch.norm(self.curr_finger_tip_goal_orn, dim=-1, keepdim=True) + 1e-8)
-        curr_finger_tip_goal_orn_6d_base = quat_to_mat6d(curr_finger_tip_goal_orn_normalized)
+        curr_finger_tip_goal_orn_6d_base = quat_to_mat6d(curr_finger_tip_goal_orn_normalized) # shape: (num_envs, num_fingers, 6)
+        # # ⚠️ 关键修复：裁剪6D表示到合理范围
+        # curr_finger_tip_goal_orn_6d_base = torch.clamp(curr_finger_tip_goal_orn_6d_base, min=-2.0, max=2.0)
         finger_tip_orn_6d_error = finger_tip_orn_6d_base - curr_finger_tip_goal_orn_6d_base
 
-        # sensor_forces
-        sensor_forces_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),self.sensors_forces[:,0,:3].clone().squeeze(1))
-        sensor_forces_base = quat_rotate_inverse(self.base_quat,sensor_forces_world)
-
-        F_cmd_local = self.commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]
-        F_cmd_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),F_cmd_local)
-        F_cmd_base = quat_rotate_inverse(self.base_quat,F_cmd_world)
+        # # sensor_forces
+        # sensor_forces_world = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone(),self.sensors_forces[:,:,:3].clone())
+        # sensor_forces_base = quat_rotate_inverse(base_quat_reshaped,sensor_forces_world.reshape(-1,3)).reshape(self.num_envs,num_fingers,3)
+        
+        # 实时记录 self.sensors_forces[0,1,0:3] 的值
+        if self.enable_realtime_plot:
+            cmd_forces_xyz = self.current_Fxyz_finger_tips_cmd_local[0, 2, 0:3].cpu().clone().numpy()
+            self.cmd_forces_history.append(cmd_forces_xyz)
+            
+            # 实时更新绘图（每10步更新一次，避免太频繁）
+            if len(self.step_history) > 0 and len(self.step_history) % 10 == 0:
+                self._update_realtime_plots()
+        
+        # commands 中的 F_cmd 已经是 base 坐标系，直接使用
+        F_cmd_base = self.commands[:,:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]  # (num_envs, num_fingers, 3)
         commands = self.commands.clone()
-        commands[:,INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)] = F_cmd_base
+        # 不需要再转换
 
-        forces_error = sensor_forces_base - F_cmd_base
+        forces_error = forces_base + F_cmd_base
 
-
+        # normalize pos
+        finger_tip_pos_base_normalized = self._normalize_pos(finger_tip_pos_base) # shape: (num_envs, num_fingers, 3)
+        curr_finger_tip_goal_cart_base_normalized = self._normalize_pos(curr_finger_tip_goal_cart_base) # (num_envs, num_fingers, 3)
+        pos_cmd_normalized = self._normalize_pos(commands[:,:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)]) # (num_envs, num_fingers*3)
+        
         self.privileged_obs_buf = torch.cat((
 
-                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
-                                self.dof_vel[:,4:8]* self.cfg.normalization.obs_scales.dof_vel,#4
-                                self.actions[:,:4] * self.cfg.control.action_scale, # 4
+                                self.dof_pos[:,:] * self.cfg.normalization.obs_scales.dof_pos,#20
+                                self.dof_vel[:,:]* self.cfg.normalization.obs_scales.dof_vel,#20
+                                # self.actions[:,:] * self.cfg.control.action_scale, # 20
+                                # 食指位置 归一化
+                                finger_tip_pos_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
 
-                                2 * (finger_tip_pos_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2 * (finger_tip_pos_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2 * (finger_tip_pos_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
                                 # 食指旋转 6d
-                                finger_tip_orn_6d_base, # 6
-                                finger_tip_vel_base * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 3
+                                finger_tip_orn_6d_base.reshape(self.num_envs,-1), # 5*6=30
+                                # 食指速度
+                                finger_tip_vel_base.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 5*3=15
               
-                                2*(curr_finger_tip_goal_cart_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2*(curr_finger_tip_goal_cart_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2*(curr_finger_tip_goal_cart_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
-                                finger_tip_pos_error * self.cfg.normalization.obs_scales.pose_error,# 3
-                                 # 旋转误差 6d
-                                finger_tip_orn_6d_error * self.cfg.normalization.obs_scales.orn_error,# 6
-                                forces_error* self.cfg.normalization.obs_scales.force_error,# 3
-
-                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
-
-                                2*(commands[:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_X_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2*(commands[:,INDEX_TIP_POS_Y_CMD:(INDEX_TIP_POS_Y_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2*(commands[:,INDEX_TIP_POS_Z_CMD:(INDEX_TIP_POS_Z_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
-                                commands[:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] * self.cfg.normalization.obs_scales.orientation_cmd, # 4
-                                commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] * self.cfg.normalization.obs_scales.force_cmd,# 3
+                                # 目标位置
+                                curr_finger_tip_goal_cart_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
+                                
+                                # 位置误差
+                                finger_tip_pos_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.pose_error,# 5*3=15
+                                # 旋转误差 6d
+                                finger_tip_orn_6d_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.orn_error,# 5*6=30
+                                
+                                # 力误差
+                                forces_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.force_error,# 5*3=15
+                                
+                                # 用外力模仿 传感器力
+                                forces_base.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.sensor_force,# 5*3=15
+                                
+                                # POS_CMD
+                                pos_cmd_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
+                                # ORIENTATION_CMD
+                                commands[:,:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1].reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.orientation_cmd, # 5*4=20
+                                # FORCE_CMD 
+                                commands[:,:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.force_cmd,# 5*3=15
                             ),dim=-1) # 52
         obs_pred = torch.cat((
-                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
-                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
-                                finger_tip_vel_base * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 3
-                                forces_error * self.cfg.normalization.obs_scales.force_error,# 3
-                            ),dim=-1) #13
+                                finger_tip_vel_base.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 5*3=15
+                            ),dim=-1) #15
 
         obs_buf = torch.cat((   
                                 # 关节角度
-                                self.dof_pos[:,4:8] * self.cfg.normalization.obs_scales.dof_pos,#4
-                                # 上一次动作
-                                self.actions[:,:4] * self.cfg.control.action_scale,
+                                self.dof_pos[:,:] * self.cfg.normalization.obs_scales.dof_pos,#20
+                                # # 上一次动作
+                                # self.actions[:,:] * self.cfg.control.action_scale, # 20
                                 # 食指位置
-                                2 * (finger_tip_pos_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2 * (finger_tip_pos_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2 * (finger_tip_pos_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                finger_tip_pos_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
                                 # 食指旋转 6d
-                                finger_tip_orn_6d_base, #6
+                                finger_tip_orn_6d_base.reshape(self.num_envs,-1), #5*6=30
                                 # 目标位置
-                                2*(curr_finger_tip_goal_cart_base[:,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2*(curr_finger_tip_goal_cart_base[:,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2*(curr_finger_tip_goal_cart_base[:,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
+                                curr_finger_tip_goal_cart_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
                                 # 位置误差
-                                finger_tip_pos_error * self.cfg.normalization.obs_scales.pose_error,# 3
+                                finger_tip_pos_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.pose_error,# 5*3=15
                                 # 旋转误差 6d
-                                finger_tip_orn_6d_error * self.cfg.normalization.obs_scales.orn_error,# 6
+                                finger_tip_orn_6d_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.orn_error,# 5*6=30
                                 # 传感器力
-                                sensor_forces_base * self.cfg.normalization.obs_scales.sensor_force,# 3
+                                forces_base.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.sensor_force,# 5*3=15
                                 # 力误差
-                                forces_error * self.cfg.normalization.obs_scales.force_error,# 3
-                                # 目标位置
-                                2*(commands[:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_X_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max - self.cfg.normalization.obs_scales.finger_tip_pos_x_min) - 1,# 1
-                                2*(commands[:,INDEX_TIP_POS_Y_CMD:(INDEX_TIP_POS_Y_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max - self.cfg.normalization.obs_scales.finger_tip_pos_y_min) - 1,# 1
-                                2*(commands[:,INDEX_TIP_POS_Z_CMD:(INDEX_TIP_POS_Z_CMD+1)] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max - self.cfg.normalization.obs_scales.finger_tip_pos_z_min) - 1,# 1
-                                 # 目标旋转
-                                commands[:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] * self.cfg.normalization.obs_scales.orientation_cmd, # 4
-                                # 目标力
-                                commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] * self.cfg.normalization.obs_scales.force_cmd, # 3
+                                forces_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.force_error,# 5*3=15
+                                # POS_CMD
+                                pos_cmd_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
+                                # ORIENTATION_CMD
+                                commands[:,:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1].reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.orientation_cmd, # 5*4=20
+                                # FORCE_CMD
+                                commands[:,:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.force_cmd, # 5*3=15
                             ),dim=-1) #45
+
         # add perceptive inputs if not blind
         # add noise if needed
         if self.add_noise:  
@@ -784,54 +831,60 @@ class WujiRobot_pos_force(BaseTask):
 
         sphere_geom_4 = gymutil.WireframeSphereGeometry(0.001, 4, 4, None, color=(1, 0, 1)) # 紫
 
-        sphere_geom_2 = gymutil.WireframeSphereGeometry(0.1, 4, 4, None, color=(0, 0, 1)) # 蓝
-        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3]
-
         sphere_geom_origin = gymutil.WireframeSphereGeometry(0.001, 8, 8, None, color=(0, 1, 0)) # 绿
         sphere_pose = gymapi.Transform(gymapi.Vec3(0, 0, 0), r=None)
         gymutil.draw_lines(sphere_geom_origin, self.gym, self.viewer, self.envs[0], sphere_pose)
 
         axes_geom = gymutil.AxesGeometry(scale=0.2)
 
-        forces_local = self.sensors_forces[:, 0, :3]
-        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
-        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].squeeze(1), forces_local + forces_cmd_local)
-        curr_finger_tip_goal_cart_global = quat_apply(self.base_quat, self.curr_finger_tip_goal_cart)+self.base_pos
+        # forces_local = self.sensors_forces[:, :, :3]
+        forces_local = self.forces[:,self.finger_tips_idx,:3]
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local
 
-        curr_ee_goal_cart_world_offset = forces_offset_global / self.gripper_force_kps + curr_finger_tip_goal_cart_global
+        forces_offset_local = (forces_local + forces_cmd_local)
+
+        forces_offset_base = self.transform_force_finger_tip_local_to_base(forces_offset_local)
+
+        # 计算考虑力偏移的目标位置 shape: (num_envs, num_fingers, 3)
+        curr_finger_tip_goal_cart_base = forces_offset_base / (self.gripper_force_kps) + self.curr_finger_tip_goal_cart
+        curr_ee_goal_cart_world_offset = self.transform_pos_base_to_world(curr_finger_tip_goal_cart_base)
+        curr_finger_tip_goal_cart_global = self.transform_pos_base_to_world(self.curr_finger_tip_goal_cart)
+
+        base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs,len(self.finger_tips_idx), 4) #(num_envs, len(finger_tips_idx), 4)
 
         # 将目标姿态从base坐标系转换到世界坐标系
         # q_world = q_base_world * q_base
         curr_finger_tip_goal_quat_base = self.curr_finger_tip_goal_orn
-        curr_finger_tip_goal_quat_world = quat_mul(self.base_quat, curr_finger_tip_goal_quat_base)
+        curr_finger_tip_goal_quat_world = quat_mul(base_quat_reshaped, curr_finger_tip_goal_quat_base)
 
         for i in range(self.num_envs):
-            # 当前的目标位置（x_cmd, y_cmd, z_cmd） 黄
-            sphere_pose = gymapi.Transform(gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], curr_finger_tip_goal_cart_global[i, 1], curr_finger_tip_goal_cart_global[i, 2]), r=None)
-            gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
+            for finger_idx in range(len(self.finger_tips_idx)):
+                # 当前的目标位置（x_cmd, y_cmd, z_cmd） 黄
+                sphere_pose = gymapi.Transform(gymapi.Vec3(curr_finger_tip_goal_cart_global[i,finger_idx, 0], curr_finger_tip_goal_cart_global[i,finger_idx, 1], curr_finger_tip_goal_cart_global[i,finger_idx, 2]), r=None)
+                gymutil.draw_lines(sphere_geom, self.gym, self.viewer, self.envs[i], sphere_pose) 
 
-            # x_target, y_target, z_target 紫
-            sphere_pose_4 = gymapi.Transform(gymapi.Vec3(curr_ee_goal_cart_world_offset[i, 0].item(), curr_ee_goal_cart_world_offset[i, 1].item(), curr_ee_goal_cart_world_offset[i, 2].item()), r=None)
-            gymutil.draw_lines(sphere_geom_4, self.gym, self.viewer, self.envs[i], sphere_pose_4) #紫
-            
-            # sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i,0, 0].item(), ee_pose[i,0, 1].item(), ee_pose[i,0, 2].item()), r=None)
-            # gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) #蓝
+                # x_target, y_target, z_target 紫
+                sphere_pose_4 = gymapi.Transform(gymapi.Vec3(curr_ee_goal_cart_world_offset[i,finger_idx, 0].item(), curr_ee_goal_cart_world_offset[i,finger_idx, 1].item(), curr_ee_goal_cart_world_offset[i,finger_idx, 2].item()), r=None)
+                gymutil.draw_lines(sphere_geom_4, self.gym, self.viewer, self.envs[i], sphere_pose_4) #紫
+                
+                # sphere_pose_2 = gymapi.Transform(gymapi.Vec3(ee_pose[i,0, 0].item(), ee_pose[i,0, 1].item(), ee_pose[i,0, 2].item()), r=None)
+                # gymutil.draw_lines(sphere_geom_2, self.gym, self.viewer, self.envs[i], sphere_pose_2) #蓝
 
-            # sphere_pose_3 = gymapi.Transform(gymapi.Vec3(upper_arm_pose[i, 0], upper_arm_pose[i, 1], upper_arm_pose[i, 2]), r=None)
-            # gymutil.draw_lines(sphere_geom_3, self.gym, self.viewer, self.envs[i], sphere_pose_3) 
+                # sphere_pose_3 = gymapi.Transform(gymapi.Vec3(upper_arm_pose[i, 0], upper_arm_pose[i, 1], upper_arm_pose[i, 2]), r=None)
+                # gymutil.draw_lines(sphere_geom_3, self.gym, self.viewer, self.envs[i], sphere_pose_3) 
 
-            # 绘制目标姿态的朝向（使用世界坐标系下的四元数）
-            # gymapi.Quat的参数顺序是 (x, y, z, w)
-            goal_quat_world = curr_finger_tip_goal_quat_world[i]
-            goal_quat_gymapi = gymapi.Quat(goal_quat_world[0].item(), goal_quat_world[1].item(), 
-                                           goal_quat_world[2].item(), goal_quat_world[3].item())
-            pose = gymapi.Transform(
-                gymapi.Vec3(curr_finger_tip_goal_cart_global[i, 0], 
-                           curr_finger_tip_goal_cart_global[i, 1], 
-                           curr_finger_tip_goal_cart_global[i, 2]), 
-                r=goal_quat_gymapi
-            )
-            gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
+                # 绘制目标姿态的朝向（使用世界坐标系下的四元数）
+                # gymapi.Quat的参数顺序是 (x, y, z, w)
+                goal_quat_world = curr_finger_tip_goal_quat_world[i,finger_idx]
+                goal_quat_gymapi = gymapi.Quat(goal_quat_world[0].item(), goal_quat_world[1].item(), 
+                                            goal_quat_world[2].item(), goal_quat_world[3].item())
+                pose = gymapi.Transform(
+                    gymapi.Vec3(curr_finger_tip_goal_cart_global[i,finger_idx, 0], 
+                            curr_finger_tip_goal_cart_global[i,finger_idx, 1], 
+                            curr_finger_tip_goal_cart_global[i,finger_idx, 2]), 
+                    r=goal_quat_gymapi
+                )
+                gymutil.draw_lines(axes_geom, self.gym, self.viewer, self.envs[i], pose)
 
 
     def _draw_ee_force(self):
@@ -843,42 +896,49 @@ class WujiRobot_pos_force(BaseTask):
         sphere_geom_arrow_2 = gymutil.WireframeSphereGeometry(0.001, 16, 16, None, color=(0, 1, 0))
         arrow_color_2 = [0, 1, 0]
         
-
-        F_cmd = self.commands[:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].clone()
-        F_cmd_gloal = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),F_cmd)
+        # commands 中的 F_cmd 是 base 坐标系，转换到 world 用于可视化
+        F_cmd_base = self.commands[:,:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].clone()
+        F_cmd_gloal = self.transform_force_base_to_world(F_cmd_base)
         F_cmd_norm = torch.norm(F_cmd_gloal,dim=-1,keepdim=True)
 
-        ext_forces = self.forces[:,self.finger_tips_idx,:3].clone().squeeze(1)
-        ext_forces_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1),ext_forces)
+        ext_forces = self.forces[:,self.finger_tips_idx,:3].clone()
+        finger_tip_quat = self.rigid_state[:, self.finger_tips_idx, 3:7]
+        
+        # finger_tip local -> world
+        ext_forces_global = quat_apply(
+            finger_tip_quat,
+            ext_forces.reshape(-1, 3)
+        ).reshape(self.num_envs, len(self.finger_tips_idx), 3)
         ext_forces_norm = torch.norm(ext_forces,dim=-1,keepdim=True)
 
-        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3].squeeze(1)
+        ee_pose = self.rigid_state[:, self.finger_tips_idx, :3]
 
         for i in range(self.num_envs):
-            # F_cmd 蓝色
-            start_pos = ee_pose[i].cpu().numpy()
-            arrow_direction = F_cmd_gloal[i].cpu().numpy()
-            arrow_length = F_cmd_norm[i].item() * 5
-            end_pos = start_pos + arrow_direction * arrow_length
+            for finger_idx in range(len(self.finger_tips_idx)):
+                # F_cmd 蓝色
+                start_pos = ee_pose[i,finger_idx].cpu().numpy()
+                arrow_direction = F_cmd_gloal[i,finger_idx].cpu().numpy()
+                arrow_length = F_cmd_norm[i,finger_idx].item() * 5
+                end_pos = start_pos + arrow_direction * arrow_length
 
-            verts = [start_pos, end_pos]
-            colors = [arrow_color_1, arrow_color_1]
-            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
-            head_pos = end_pos
-            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
-            gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
-            
-            # ext_forces 绿色
-            start_pos = ee_pose[i].cpu().numpy()
-            arrow_direction = ext_forces_global[i].cpu().numpy()
-            arrow_length = ext_forces_norm[i].item() * 5
-            end_pos = start_pos + arrow_direction * arrow_length
-            verts = [start_pos, end_pos]
-            colors = [arrow_color_2, arrow_color_2]
-            self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
-            head_pos = end_pos
-            head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
-            gymutil.draw_lines(sphere_geom_arrow_2, self.gym, self.viewer, self.envs[i], head_pose)
+                verts = [start_pos, end_pos]
+                colors = [arrow_color_1, arrow_color_1]
+                self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+                head_pos = end_pos
+                head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+                gymutil.draw_lines(sphere_geom_arrow_1, self.gym, self.viewer, self.envs[i], head_pose)
+                
+                # ext_forces 绿色
+                start_pos = ee_pose[i,finger_idx].cpu().numpy()
+                arrow_direction = ext_forces_global[i,finger_idx].cpu().numpy()
+                arrow_length = ext_forces_norm[i,finger_idx].item() * 5
+                end_pos = start_pos + arrow_direction * arrow_length
+                verts = [start_pos, end_pos]
+                colors = [arrow_color_2, arrow_color_2]
+                self.gym.add_lines(self.viewer, self.envs[i], len(verts), verts, colors)
+                head_pos = end_pos
+                head_pose = gymapi.Transform(gymapi.Vec3(head_pos[0], head_pos[1], head_pos[2]), r=None)
+                gymutil.draw_lines(sphere_geom_arrow_2, self.gym, self.viewer, self.envs[i], head_pose)
     
     def _draw_base_force(self):
         """ Draws visualizations for dubugging (slows down simulation a lot).
@@ -1078,31 +1138,29 @@ class WujiRobot_pos_force(BaseTask):
                 self.dof_pos_limits[i, 1] = m + 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
              # ⭐ 关键修复：为灵巧手关节（索引4:8）设置位置控制模式和PD参数
             for i in range(len(props)):
-                if i >= 4 and i < 8:  # 灵巧手关节
-                    props["driveMode"][i] = gymapi.DOF_MODE_POS  # 位置控制模式
-                    # 从配置中获取 stiffness 和 damping
-                    name = self.dof_names[i]
-                    found = False
-                    for dof_name in self.cfg.control.stiffness.keys():
-                        if dof_name in name:
-                            props["stiffness"][i] = self.cfg.control.stiffness[dof_name]
-                            props["damping"][i] = self.cfg.control.damping[dof_name]
-                            found = True
-                            print("found!")
-                            break
-                    if not found:
-                        # 使用默认值
-                        props["stiffness"][i] = 120
-                        props["damping"][i] = 0.5
+                props["driveMode"][i] = gymapi.DOF_MODE_POS  # 位置控制模式
+                # 从配置中获取 stiffness 和 damping
+                name = self.dof_names[i]
+                found = False
+                for dof_name in self.cfg.control.stiffness.keys():
+                    if dof_name in name:
+                        props["stiffness"][i] = self.cfg.control.stiffness[dof_name]
+                        props["damping"][i] = self.cfg.control.damping[dof_name]
+                        found = True
+                        print("found!")
+                        break
+                if not found:
+                    # 使用默认值
+                    props["stiffness"][i] = 120
+                    props["damping"][i] = 0.5
         return props
 
     def _randomize_dof_props(self, env_ids):
         if self.cfg.commands.randomize_gripper_force_gains:
             min_kp, max_kp = self.cfg.commands.gripper_force_kp_range
             # min_kd, max_kd = self.cfg.commands.gripper_force_kd_range
-            self.gripper_force_kps[env_ids, :] = torch.rand(len(env_ids), dtype=torch.float, device=self.device,
-                                                     requires_grad=False).unsqueeze(1) * (
-                                                  max_kp - min_kp) + min_kp
+            self.gripper_force_kps[env_ids,:,:] = torch.rand((len(env_ids), len(self.finger_tips_idx),3), dtype=torch.float, device=self.device,
+                                                     requires_grad=False)* (max_kp - min_kp) + min_kp
             # if self.cfg.commands.gripper_prop_kd > 0:
             #     self.gripper_force_kds[env_ids, :] = self.gripper_force_kps[env_ids, :] * self.cfg.commands.gripper_prop_kd
             # else:
@@ -1164,6 +1222,63 @@ class WujiRobot_pos_force(BaseTask):
         self.gait_indices = torch.remainder(self.gait_indices + self.dt / cycle_time, 1.0)
         self.gait_indices[standing_mask] = 0
 
+    def _update_realtime_plots(self):
+        """
+        实时更新三张图（x, y, z 三个分量）
+        分别显示 forces[0,1,0:3] 和 sensors_forces[0,1,0:3]
+        """
+        if not self.enable_realtime_plot or self.headless or len(self.step_history) == 0:
+            return
+        
+        try:
+            # 转换为 numpy 数组
+            steps = np.array(self.step_history)
+            forces_data = np.array(self.forces_history)  # shape: (N, 3)
+            cmd_forces_data = np.array(self.cmd_forces_history)  # shape: (N, 3)
+            
+            # 确保数据长度一致
+            min_len = min(len(steps), len(forces_data), len(cmd_forces_data))
+            steps = steps[-min_len:]
+            forces_data = forces_data[-min_len:]
+            cmd_forces_data = cmd_forces_data[-min_len:]
+            
+            # 更新三张图（x, y, z）
+            for axis_idx, axis_name in enumerate(['X', 'Y', 'Z']):
+                ax = self.axes[axis_idx]
+                ax.clear()
+                ax.set_title(f'{axis_name} Component')
+                ax.set_ylabel('Force (N)')
+                if axis_idx == 2:
+                    ax.set_xlabel('Step')
+                
+                # 绘制 forces
+                ax.plot(steps, forces_data[:, axis_idx], 'b-', label='Applied Forces', linewidth=1.5)
+                
+                # 绘制 sensor_forces
+                ax.plot(steps, cmd_forces_data[:, axis_idx], 'r-', label='Cmd Forces', linewidth=1.5)
+                
+                ax.legend(loc='upper right')
+                ax.grid(True, alpha=0.3)
+            
+            # 更新图像
+            plt.draw()
+            plt.pause(0.001)  # 短暂暂停以更新图像
+            
+        except Exception as e:
+            # 如果绘图出错，不影响主程序运行
+            if self.global_steps % 1000 == 0:
+                print(f"Warning: Error updating plots: {e}")
+
+    # 归一化pos，方便observation
+    def _normalize_pos(self, pos):
+        assert pos.shape ==(self.num_envs, len(self.finger_tips_idx), 3)
+        normalized_pos = torch.zeros_like(pos)
+        for i in range(len(self.finger_tips_idx)):
+            normalized_pos[:,i,0:1] = 2 * (pos[:,i,0:1] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min[i]) / (self.cfg.normalization.obs_scales.finger_tip_pos_x_max[i] - self.cfg.normalization.obs_scales.finger_tip_pos_x_min[i]) - 1
+            normalized_pos[:,i,1:2] = 2 * (pos[:,i,1:2] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min[i]) / (self.cfg.normalization.obs_scales.finger_tip_pos_y_max[i] - self.cfg.normalization.obs_scales.finger_tip_pos_y_min[i]) - 1
+            normalized_pos[:,i,2:3] = 2 * (pos[:,i,2:3] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min[i]) / (self.cfg.normalization.obs_scales.finger_tip_pos_z_max[i] - self.cfg.normalization.obs_scales.finger_tip_pos_z_min[i]) - 1
+        return normalized_pos
+
     # def _resample_commands(self, env_ids):
     #     """ Randommly select commands of some environments
 
@@ -1191,33 +1306,103 @@ class WujiRobot_pos_force(BaseTask):
         u = torch.bmm(j_eef_T, torch.linalg.solve(A, dpose))#.view(self.num_envs, 6)
         return u.squeeze(-1)
 
-    def _resample_ee_goal_cart_once(self, env_ids):
+    def _resample_ee_goal_cart_once(self, env_ids, max_retries=50, min_finger_distance=0.02):
+        """
+        随机采样关节角度，并确保手指不会发生自碰撞
+        
+        Args:
+            env_ids: 需要采样的环境ID列表（tensor或list）
+            max_retries: 每个环境的最大重试次数，默认50次
+            min_finger_distance: 手指之间的最小安全距离（米），默认0.02m
+        """
+        if len(env_ids) == 0:
+            return
+        
+        # 确保 env_ids 是 tensor
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(self.device)
+        
+        # 使用当前关节位置作为基础
+        last_joint = self.dof_pos.clone()  # shape: (num_envs, num_dofs)
+        # 初始化新的关节角度（基于当前关节位置）
+        rand_joint = last_joint.clone()
+        low = self.dof_pos_limits[:, 0]  # shape: (num_dofs,)
+        high = self.dof_pos_limits[:, 1]  # shape: (num_dofs,)
+        
+        # 最大 delta 变化量 (随着训练不断增大，最大到0.5，非线性增长，且越增越快)
+        # 用指数型增长，早期增长慢、后期增长快
+        progress = torch.min(torch.tensor(self.global_steps) / 10000.0, torch.tensor(1.0))
+        max_delta = 0.1 + 0.4 * (1 - torch.exp(-5 * progress))  # 指数型：增长初期缓慢，后期加速，最大0.5
+        
+        # 为每个环境单独采样，直到找到无碰撞的配置
+        remaining_env_ids = env_ids.clone()
+        
+        for retry in range(max_retries):
+            if len(remaining_env_ids) == 0:
+                break
+            
+            # 为剩余的环境生成 delta joint pos（每次改变不超过 0.2）
+            # 生成 [-max_delta, max_delta] 范围内的随机增量
+            delta_joint = torch_rand_float(
+                -max_delta, max_delta, 
+                (len(remaining_env_ids), self.num_dofs), 
+                device=self.device
+            )
+            
+            # 这样写不正确，torch.max(0.1, delta_joint) 会报错，应该用下面的方式将 delta_joint 逐元素和 0.1 比较
+            delta_joint = torch.clamp(delta_joint, min=0.1)
 
-        # 现在只考虑食指,以后记得修改
-        rand_joint = torch.zeros((self.num_envs, self.num_dofs), device=self.device)
-        low  = self.dof_pos_limits[4:8, 0]  # shape: (4,)
-        high = self.dof_pos_limits[4:8, 1]  # shape: (4,)
-
-        rand_joint[env_ids, 4:8] = low + (high - low) * torch.rand((len(env_ids), 4), device=self.device)
-        self._pinocchio_forward_kinematics(rand_joint, env_ids)
+            # 基于当前关节位置加上 delta
+            new_joint = last_joint[remaining_env_ids, :] + delta_joint
+            
+            # 确保新的关节角度在限制范围内
+            new_joint = torch.clamp(new_joint, low.unsqueeze(0), high.unsqueeze(0))
+            
+            # 更新 rand_joint
+            rand_joint[remaining_env_ids, :] = new_joint
+            
+            # 计算正向运动学
+            self._pinocchio_forward_kinematics(rand_joint, remaining_env_ids)
+            
+            # 检查碰撞
+            collision_mask = self._check_finger_self_collision(remaining_env_ids, min_distance=min_finger_distance)
+            
+            # 找出仍然有碰撞的环境
+            colliding_env_ids = remaining_env_ids[~collision_mask]
+            
+            # 找出无碰撞的环境（成功采样的环境）
+            success_env_ids = remaining_env_ids[collision_mask]
+            
+            # 如果所有环境都无碰撞，退出循环
+            if len(colliding_env_ids) == 0:
+                break
+            
+            # 如果达到最大重试次数，使用最后一次采样的结果（即使有碰撞）
+            if retry == max_retries - 1:
+                if len(colliding_env_ids) > 0:
+                    print(f"Warning: {len(colliding_env_ids)} environments still have finger collisions after {max_retries} retries. Using last sampled configuration.")
+                break
+            
+            # 更新 last_joint：对于成功采样的环境，更新为新的关节位置；对于有碰撞的环境，保持上一次的值以便下次重试
+            if len(success_env_ids) > 0:
+                last_joint[success_env_ids, :] = rand_joint[success_env_ids, :]
+            
+            # 继续为有碰撞的环境重试（基于上一次的关节位置）
+            remaining_env_ids = colliding_env_ids
 
         # self.ee_goal_sphere[env_ids, 0] = torch_rand_float(self.goal_ee_ranges["pos_l"][0], self.goal_ee_ranges["pos_l"][1], (len(env_ids), 1), device=self.device).squeeze(1)
         # self.ee_goal_sphere[env_ids, 1] = torch_rand_float(self.goal_ee_ranges["pos_p"][0], self.goal_ee_ranges["pos_p"][1], (len(env_ids), 1), device=self.device).squeeze(1)
         # self.ee_goal_sphere[env_ids, 2] = torch_rand_float(self.goal_ee_ranges["pos_y"][0], self.goal_ee_ranges["pos_y"][1], (len(env_ids), 1), device=self.device).squeeze(1)
     
-    def _resample_ee_goal_orn_once(self, env_ids):
-        ee_goal_delta_orn_r = torch_rand_float(self.goal_ee_ranges["delta_orn_r"][0], self.goal_ee_ranges["delta_orn_r"][1], (len(env_ids), 1), device=self.device)
-        ee_goal_delta_orn_p = torch_rand_float(self.goal_ee_ranges["delta_orn_p"][0], self.goal_ee_ranges["delta_orn_p"][1], (len(env_ids), 1), device=self.device)
-        ee_goal_delta_orn_y = torch_rand_float(self.goal_ee_ranges["delta_orn_y"][0], self.goal_ee_ranges["delta_orn_y"][1], (len(env_ids), 1), device=self.device)
-        self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
+    # def _resample_ee_goal_orn_once(self, env_ids):
+    #     ee_goal_delta_orn_r = torch_rand_float(self.goal_ee_ranges["delta_orn_r"][0], self.goal_ee_ranges["delta_orn_r"][1], (len(env_ids), 1), device=self.device)
+    #     ee_goal_delta_orn_p = torch_rand_float(self.goal_ee_ranges["delta_orn_p"][0], self.goal_ee_ranges["delta_orn_p"][1], (len(env_ids), 1), device=self.device)
+    #     ee_goal_delta_orn_y = torch_rand_float(self.goal_ee_ranges["delta_orn_y"][0], self.goal_ee_ranges["delta_orn_y"][1], (len(env_ids), 1), device=self.device)
+    #     self.ee_goal_orn_delta_rpy[env_ids, :] = torch.cat([ee_goal_delta_orn_r, ee_goal_delta_orn_p, ee_goal_delta_orn_y], dim=-1)
 
     def _resample_ee_goal(self, env_ids, is_init=False):
-        # if self.cfg.env.teleop_mode and is_init:
-        #     self.curr_ee_goal_sphere[:] = self.init_start_ee_sphere[:]
-        #     self.commands[:, INDEX_EE_POS_RADIUS_CMD:(INDEX_EE_POS_YAW_CMD+1)] = self.curr_ee_goal_sphere.view(self.num_envs,3)
-        #     return
-        # elif self.cfg.env.teleop_mode:
-        #     return
 
         if len(env_ids) > 0:
             init_env_ids = env_ids.clone()
@@ -1230,17 +1415,21 @@ class WujiRobot_pos_force(BaseTask):
             # ee_pos_sphe_arm = torch.cat((radius, pitch, yaw), dim=1).view(self.num_envs,3)
             if is_init:
                 if self.global_steps < 0 * 24 and not self.play:
-                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
-                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+                    self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[env_ids]
+                    self.finger_tip_goal_orn[env_ids] = self.init_start_finger_tip_orn[env_ids]
                 else:
-                    # self.finger_tip_goal_cart[env_ids] = self.init_start_finger_tip_cart[:]
+
+                    base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs,len(self.finger_tips_idx), 4) #(num_envs, len(finger_tips_idx), 4)
+                    base_pos_reshaped = self.base_pos.unsqueeze(1).expand(self.num_envs,len(self.finger_tips_idx), 3) #(num_envs, len(finger_tips_idx), 3)
                     self.finger_tip_goal_cart[env_ids] = quat_rotate_inverse(
-                        self.base_quat[env_ids],self.rigid_state[env_ids,self.finger_tips_idx,:3].clone().squeeze(1) - self.base_pos[env_ids])
-                    
+                        base_quat_reshaped[env_ids,:,:].reshape(-1, 4),
+                        (self.rigid_state[env_ids[:,None],self.finger_tips_idx,:3].clone()-  base_pos_reshaped[env_ids,:,:]).reshape(len(env_ids)*len(self.finger_tips_idx), 3)
+                        ).reshape(len(env_ids), len(self.finger_tips_idx), 3)
+
                     # ⭐ 正确方法：四元数坐标转换（世界系 -> base系）
                     # 不能用 quat_rotate_inverse（那是旋转向量的），要用四元数乘法
-                    finger_tip_quat_world = self.rigid_state[env_ids, self.finger_tips_idx, 3:7].clone().squeeze(1)
-                    finger_tip_quat_base = quat_mul(quat_conjugate(self.base_quat[env_ids]), finger_tip_quat_world)
+                    finger_tip_quat_world = self.rigid_state[env_ids[:,None], self.finger_tips_idx, 3:7].clone() #(num_envs, len(finger_tips_idx), 4)
+                    finger_tip_quat_base = quat_mul(quat_conjugate(base_quat_reshaped[env_ids].reshape(-1, 4)), finger_tip_quat_world.reshape(-1, 4)).reshape(len(env_ids), len(self.finger_tips_idx), 4)
                     self.finger_tip_goal_orn[env_ids] = finger_tip_quat_base
             else:
                 if self.global_steps < 0 * 24 and not self.play:
@@ -1249,8 +1438,14 @@ class WujiRobot_pos_force(BaseTask):
                 else:
                     self.finger_tip_start_cart[env_ids] = self.finger_tip_goal_cart[env_ids].clone()
                     self.finger_tip_start_orn[env_ids] = self.finger_tip_goal_orn[env_ids].clone()
-                    # for i in range(10):
-                    self._resample_ee_goal_cart_once(env_ids)
+                    
+                    
+                    # 随机采样，确保手指不会碰撞在一起
+                    self._resample_ee_goal_cart_once(
+                        env_ids, 
+                        max_retries=self.cfg.goal_ee.max_collision_check_retries,
+                        min_finger_distance=self.cfg.goal_ee.min_finger_distance
+                    )
                         # collision_mask = self.collision_check(env_ids)
                         # env_ids = env_ids[collision_mask]
                         # if len(env_ids) == 0:
@@ -1269,12 +1464,17 @@ class WujiRobot_pos_force(BaseTask):
             t = torch.clip(self.goal_timer / self.traj_timesteps, 0, 1)
 
             # translation
-            self.curr_finger_tip_goal_cart[:] = torch.lerp(self.finger_tip_start_cart, self.finger_tip_goal_cart, t[:, None])
-            self.commands[:, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = self.curr_finger_tip_goal_cart.view(self.num_envs,3)
+            # t[:, None, None] 形状为 (num_envs, 1, 1)，可以正确广播到 (num_envs, len(finger_tips_idx), 3)
+            self.curr_finger_tip_goal_cart[:] = torch.lerp(self.finger_tip_start_cart, self.finger_tip_goal_cart, t[:, None,None])
+            # commands 形状: (num_envs, len(finger_tips_idx), num_commands_per_finger_tip)
+            # curr_finger_tip_goal_cart 形状: (num_envs, len(finger_tips_idx), 3)
+            self.commands[:, :, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = self.curr_finger_tip_goal_cart
             
             # rotation
-            self.curr_finger_tip_goal_orn[:] = slerp_xyzw(self.finger_tip_start_orn, self.finger_tip_goal_orn, t[:, None])
-            self.commands[:, INDEX_TIP_ORIENTATION_X_CMD:(INDEX_TIP_ORIENTATION_W_CMD+1)] = self.curr_finger_tip_goal_orn.view(self.num_envs,4)
+            # t[:, None, None] 形状为 (num_envs, 1, 1)，可以正确广播到 (num_envs, len(finger_tips_idx), 4)
+            self.curr_finger_tip_goal_orn[:] = slerp_xyzw(self.finger_tip_start_orn, self.finger_tip_goal_orn, t[:, None, None])
+            # curr_finger_tip_goal_orn 形状: (num_envs, len(finger_tips_idx), 4)
+            self.commands[:, :, INDEX_TIP_ORIENTATION_X_CMD:(INDEX_TIP_ORIENTATION_W_CMD+1)] = self.curr_finger_tip_goal_orn
 
         self.goal_timer += 1
         resample_id = (self.goal_timer > self.traj_total_timesteps).nonzero(as_tuple=False).flatten()
@@ -1298,11 +1498,11 @@ class WujiRobot_pos_force(BaseTask):
         self.dof_pos[env_ids] = self.default_dof_pos
         # self.dof_pos[env_ids, 4:8] = self.default_dof_pos[4:8] * torch_rand_float(0.5, 1.5, (len(env_ids), 4), device=self.device)
          # 在关节限制范围内随机初始化灵巧手关节位置，而不是乘以因子（避免默认位置为0时无法随机化）
-        low = self.dof_pos_limits[4:8, 0]
-        high = self.dof_pos_limits[4:8, 1]
+        low = self.dof_pos_limits[:, 0]
+        high = self.dof_pos_limits[:, 1]
         # 在[low + 0.1*(high-low), high - 0.1*(high-low)]范围内随机，避免初始化在极限位置
         margin = 0.1 * (high - low)
-        self.dof_pos[env_ids, 4:8] = (low + margin) + (high - low - 2*margin) * torch.rand((len(env_ids), 4), device=self.device)
+        self.dof_pos[env_ids, :] = (low + margin) + (high - low - 2*margin) * torch.rand((len(env_ids), self.num_dofs), device=self.device)
         
         
         self.dof_vel[env_ids] = 0.
@@ -1367,14 +1567,14 @@ class WujiRobot_pos_force(BaseTask):
                 self.freed_envs_finger_tips_cmd[new_selected_env_ids_cmd] = torch.rand(len(new_selected_env_ids_cmd), dtype=torch.float, device=self.device, requires_grad=False) > self.cfg.commands.finger_tips_forced_prob_cmd
                 min_force_cmd_x = self.cfg.commands.max_push_force_finger_tips_cmd_x[0]
                 max_force_cmd_x = self.cfg.commands.max_push_force_finger_tips_cmd_x[1]
-                min_force_cmd_y = self.cfg.commands.mam_push_force_finger_tips_cmd_y[0]
-                max_force_cmd_y = self.cfg.commands.mam_push_force_finger_tips_cmd_y[1]
-                min_force_cmd_z = self.cfg.commands.mam_push_force_finger_tips_cmd_z[0]
-                max_force_cmd_z = self.cfg.commands.mam_push_force_finger_tips_cmd_z[1]
-
-                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 0] = torch_rand_float(min_force_cmd_x, max_force_cmd_x, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
-                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 1] = torch_rand_float(min_force_cmd_y, max_force_cmd_y, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
-                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, 2] = torch_rand_float(min_force_cmd_z, max_force_cmd_z, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd))
+                min_force_cmd_y = self.cfg.commands.max_push_force_finger_tips_cmd_y[0]
+                max_force_cmd_y = self.cfg.commands.max_push_force_finger_tips_cmd_y[1]
+                min_force_cmd_z = self.cfg.commands.max_push_force_finger_tips_cmd_z[0]
+                max_force_cmd_z = self.cfg.commands.max_push_force_finger_tips_cmd_z[1]
+                # torch_rand_float 只接受2维shape (int, int)，生成 (len(env_ids), num_fingers) 的张量
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, :, 0] = torch_rand_float(min_force_cmd_x, max_force_cmd_x, (len(new_selected_env_ids_cmd), len(self.finger_tips_idx)), device=self.device)
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, :, 1] = torch_rand_float(min_force_cmd_y, max_force_cmd_y, (len(new_selected_env_ids_cmd), len(self.finger_tips_idx)), device=self.device)
+                self.force_target_finger_tips_cmd[new_selected_env_ids_cmd, :, 2] = torch_rand_float(min_force_cmd_z, max_force_cmd_z, (len(new_selected_env_ids_cmd), len(self.finger_tips_idx)), device=self.device)
 
 
                 push_duration_finger_tips_cmd = torch_rand_float(self.push_duration_finger_tips_cmd_min, self.push_duration_finger_tips_cmd_max, (len(new_selected_env_ids_cmd), 1), device=self.device).view(len(new_selected_env_ids_cmd)) # 4.0/self.dt
@@ -1392,46 +1592,81 @@ class WujiRobot_pos_force(BaseTask):
                 env_ids_apply_push_step1 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] < (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1]).type(torch.int32)]
                 # print(env_ids_apply_push_step1)
                 if env_ids_apply_push_step1.nelement() > 0:
-                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1)
+                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(-1)
                     
-                    self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, :3] = (self.force_target_finger_tips_cmd[env_ids_apply_push_step1, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                    self.current_Fxyz_finger_tips_cmd_local[env_ids_apply_push_step1, :, :3] = (self.force_target_finger_tips_cmd[env_ids_apply_push_step1, :, :3]/push_duration_reshaped)*(
+                        torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
                     
-                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_X] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 0] #torch.norm(self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, :2], dim=1)
-                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_Y] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 1] #torch.atan2(self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, 1], self.current_Fxyz_gripper_cmd[env_ids_apply_push_step1, 0])
-                    self.commands[env_ids_apply_push_step1, INDEX_TIP_FORCE_Z] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step1, 2]
+                    
+                    forces_local = self.current_Fxyz_finger_tips_cmd_local[env_ids_apply_push_step1]
+                    finger_tip_quat = self.rigid_state[env_ids_apply_push_step1[..., None], self.finger_tips_idx, 3:7]
+                    base_quat_expanded = self.base_quat[env_ids_apply_push_step1].unsqueeze(1).expand(len(env_ids_apply_push_step1), len(self.finger_tips_idx), 4)
+                    
+                    # finger_tip local -> world
+                    forces_world = quat_apply(
+                        finger_tip_quat.reshape(-1, 4),
+                        forces_local.reshape(-1, 3)
+                    ).reshape(len(env_ids_apply_push_step1), len(self.finger_tips_idx), 3)
+                    
+                    # world -> base
+                    F_cmd_base  = quat_rotate_inverse(
+                        base_quat_expanded.reshape(-1, 4),
+                        forces_world.reshape(-1, 3)
+                    ).reshape(len(env_ids_apply_push_step1), len(self.finger_tips_idx), 3)
+
+                    self.commands[env_ids_apply_push_step1, :, INDEX_TIP_FORCE_X] = F_cmd_base[:, :, 0]
+                    self.commands[env_ids_apply_push_step1, :, INDEX_TIP_FORCE_Y] = F_cmd_base[:, :, 1]
+                    self.commands[env_ids_apply_push_step1, :, INDEX_TIP_FORCE_Z] = F_cmd_base[:, :, 2]
  
                 # Step 2: apply force from force_target_gripper_cmd back to 0
                 env_ids_apply_push_step2 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] > (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1] + self.settling_time_force_finger_tips).type(torch.int32)]
                 if env_ids_apply_push_step2.nelement() > 0:
-                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1)
-                    self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, :3] = self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :3] - (self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                    push_duration_reshaped = self.push_duration_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(-1)
+                    self.current_Fxyz_finger_tips_cmd_local[env_ids_apply_push_step2,:, :3] = self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :, :3] - (self.force_target_finger_tips_cmd[env_ids_apply_push_step2, :, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(-1) - (self.push_end_time_finger_tips_cmd[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
                 
-                    # World frame
-                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_X] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 0] #torch.norm(self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, :2], dim=1)
-                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_Y] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 1] #torch.atan2(self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 1], self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 0])
-                    self.commands[env_ids_apply_push_step2, INDEX_TIP_FORCE_Z] = self.current_Fxyz_finger_tips_cmd[env_ids_apply_push_step2, 2]
+
+
+                    forces_local = self.current_Fxyz_finger_tips_cmd_local[env_ids_apply_push_step2]
+                    finger_tip_quat = self.rigid_state[env_ids_apply_push_step2[..., None], self.finger_tips_idx, 3:7]
+                    base_quat_expanded = self.base_quat[env_ids_apply_push_step2].unsqueeze(1).expand(len(env_ids_apply_push_step2), len(self.finger_tips_idx), 4)
+                    
+                    # finger_tip local -> world
+                    forces_world = quat_apply(
+                        finger_tip_quat.reshape(-1, 4),
+                        forces_local.reshape(-1, 3)
+                    ).reshape(len(env_ids_apply_push_step2), len(self.finger_tips_idx), 3)
+                    
+                    # world -> base
+                    F_cmd_base  = quat_rotate_inverse(
+                        base_quat_expanded.reshape(-1, 4),
+                        forces_world.reshape(-1, 3)
+                    ).reshape(len(env_ids_apply_push_step2), len(self.finger_tips_idx), 3)
+
+                    self.commands[env_ids_apply_push_step2, :, INDEX_TIP_FORCE_X] = F_cmd_base[:, :, 0]
+                    self.commands[env_ids_apply_push_step2, :, INDEX_TIP_FORCE_Y] = F_cmd_base[:, :, 1]
+                    self.commands[env_ids_apply_push_step2, :, INDEX_TIP_FORCE_Z] = F_cmd_base[:, :, 2]
                     
                 # Reset the tensors
                 env_ids_to_reset = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_cmd == 1] >= (self.push_end_time_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1] + self.settling_time_force_finger_tips + self.push_duration_finger_tips_cmd[self.selected_env_ids_finger_tips_cmd == 1]).type(torch.int32)]
                 if env_ids_to_reset.nelement() > 0:
                     self.selected_env_ids_finger_tips_cmd[env_ids_to_reset] = 0
                     self.force_target_finger_tips_cmd[env_ids_to_reset, :3] = 0.
-                    self.current_Fxyz_finger_tips_cmd[env_ids_to_reset, :3] = 0.
+                    self.current_Fxyz_finger_tips_cmd_local[env_ids_to_reset, :3] = 0.
                     self.push_end_time_finger_tips_cmd[env_ids_to_reset] = 0.
                     self.push_duration_finger_tips_cmd[env_ids_to_reset] = 0.
-                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_X] = 0.0
-                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_Y] = 0.0
-                    self.commands[env_ids_to_reset, INDEX_TIP_FORCE_Z] = 0.0
+                    self.commands[env_ids_to_reset,:, INDEX_TIP_FORCE_X] = 0.0
+                    self.commands[env_ids_to_reset,:, INDEX_TIP_FORCE_Y] = 0.0
+                    self.commands[env_ids_to_reset,:, INDEX_TIP_FORCE_Z] = 0.0
                     self.push_interval_finger_tips_cmd[env_ids_to_reset, 0] = torch.randint(int(self.push_interval_finger_tips_cmd_min), int(self.push_interval_finger_tips_cmd_max), (len(env_ids_to_reset), 1), device=self.device)[:, 0]
                     
             self.selected_env_ids_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0
-            self.force_target_finger_tips_cmd[self.freed_envs_finger_tips_cmd, :3] = 0.
-            self.current_Fxyz_finger_tips_cmd[self.freed_envs_finger_tips_cmd, :3] = 0.
+            self.force_target_finger_tips_cmd[self.freed_envs_finger_tips_cmd,:, :3] = 0.
+            self.current_Fxyz_finger_tips_cmd_local[self.freed_envs_finger_tips_cmd,:, :3] = 0.
             self.push_end_time_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0.
             self.push_duration_finger_tips_cmd[self.freed_envs_finger_tips_cmd] = 0. 
-            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_X] = 0.0
-            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_Y] = 0.0
-            self.commands[self.freed_envs_finger_tips_cmd, INDEX_TIP_FORCE_Z] = 0.0
+            self.commands[self.freed_envs_finger_tips_cmd,:, INDEX_TIP_FORCE_X] = 0.0
+            self.commands[self.freed_envs_finger_tips_cmd,:, INDEX_TIP_FORCE_Y] = 0.0
+            self.commands[self.freed_envs_finger_tips_cmd,:, INDEX_TIP_FORCE_Z] = 0.0
 
 
             # ext force
@@ -1444,15 +1679,21 @@ class WujiRobot_pos_force(BaseTask):
                 self.freed_envs_finger_tips_ext[new_selected_env_ids_ext] = torch.rand(len(new_selected_env_ids_ext), dtype=torch.float, device=self.device, requires_grad=False) > self.cfg.commands.finger_tips_forced_prob_ext
                 min_force_ext_x = self.cfg.commands.max_push_force_finger_tips_ext_x[0]
                 max_force_ext_x = self.cfg.commands.max_push_force_finger_tips_ext_x[1]
-                min_force_ext_y = self.cfg.commands.mam_push_force_finger_tips_ext_y[0]
-                max_force_ext_y = self.cfg.commands.mam_push_force_finger_tips_ext_y[1]
-                min_force_ext_z = self.cfg.commands.mam_push_force_finger_tips_ext_z[0]
-                max_force_ext_z = self.cfg.commands.mam_push_force_finger_tips_ext_z[1]
+                min_force_ext_y = self.cfg.commands.max_push_force_finger_tips_ext_y[0]
+                max_force_ext_y = self.cfg.commands.max_push_force_finger_tips_ext_y[1]
+                min_force_ext_z = self.cfg.commands.max_push_force_finger_tips_ext_z[0]
+                max_force_ext_z = self.cfg.commands.max_push_force_finger_tips_ext_z[1]
 
-                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 0] = torch_rand_float(min_force_ext_x, max_force_ext_x, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
-                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 1] = torch_rand_float(min_force_ext_y, max_force_ext_y, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
-                self.force_target_finger_tips_ext[new_selected_env_ids_ext, 2] = torch_rand_float(min_force_ext_z, max_force_ext_z, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext))
-
+                # torch_rand_float 只接受2维shape (int, int)，生成 (len(env_ids), num_fingers) 的张量
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, :, 0] = torch_rand_float(min_force_ext_x, max_force_ext_x, (len(new_selected_env_ids_ext), len(self.finger_tips_idx)), device=self.device)
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, :, 1] = torch_rand_float(min_force_ext_y, max_force_ext_y, (len(new_selected_env_ids_ext), len(self.finger_tips_idx)), device=self.device)
+                self.force_target_finger_tips_ext[new_selected_env_ids_ext, :, 2] = torch_rand_float(min_force_ext_z, max_force_ext_z, (len(new_selected_env_ids_ext), len(self.finger_tips_idx)), device=self.device)
+                
+                # # ⚠️ 修复：正确的形状设置 - 为所有手指设置 [1, 1, 1]
+                # self.force_target_finger_tips_ext[new_selected_env_ids_ext, :, 0:3] = torch.ones(
+                #     len(new_selected_env_ids_ext), len(self.finger_tips_idx), 3, 
+                #     device=self.device
+                # )
                 
                 push_duration_finger_tips_ext = torch_rand_float(self.push_duration_finger_tips_ext_min, self.push_duration_finger_tips_ext_max, (len(new_selected_env_ids_ext), 1), device=self.device).view(len(new_selected_env_ids_ext)) # 4.0/self.dt
                 push_duration_finger_tips_ext = torch.clip(push_duration_finger_tips_ext, max=(self.push_interval_finger_tips_ext[new_selected_env_ids_ext, 0] - self.settling_time_force_finger_tips)/2).to(self.device)
@@ -1469,34 +1710,35 @@ class WujiRobot_pos_force(BaseTask):
                 env_ids_apply_push_step1 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] < (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1]).type(torch.int32)]
                 # print(env_ids_apply_push_step1)
                 if env_ids_apply_push_step1.nelement() > 0:
-                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1)
-                    
-                    self.forces[env_ids_apply_push_step1, self.finger_tips_idx, :3] = (self.force_target_finger_tips_ext[env_ids_apply_push_step1, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(-1)
+        
+                    self.forces[env_ids_apply_push_step1[:, None], self.finger_tips_idx, :3] = (self.force_target_finger_tips_ext[env_ids_apply_push_step1,:, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step1].unsqueeze(-1).unsqueeze(1)-push_duration_reshaped), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
                   
                 # Step 2: apply force from force_target_finger_tips_cmd back to 0
                 env_ids_apply_push_step2 = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] > (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1] + self.settling_time_force_finger_tips).type(torch.int32)]
                 if env_ids_apply_push_step2.nelement() > 0:
-                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1)
+                    push_duration_reshaped = self.push_duration_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(-1)
                     
                     # world frame
-                    self.forces[env_ids_apply_push_step2, self.finger_tips_idx, :3] = self.force_target_finger_tips_ext[env_ids_apply_push_step2, :3] - (self.force_target_finger_tips_ext[env_ids_apply_push_step2, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
+                    self.forces[env_ids_apply_push_step2[:, None], self.finger_tips_idx, :3] = self.force_target_finger_tips_ext[env_ids_apply_push_step2,:, :3] - (self.force_target_finger_tips_ext[env_ids_apply_push_step2,:, :3]/push_duration_reshaped)*(torch.clamp(self.episode_length_buf[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(-1) - (self.push_end_time_finger_tips_ext[env_ids_apply_push_step2].unsqueeze(-1).unsqueeze(1)+self.settling_time_force_finger_tips), torch.zeros_like(push_duration_reshaped), push_duration_reshaped))
                 
                     
                 # Reset the tensors
                 env_ids_to_reset = subset_env_ids_selected[self.episode_length_buf[self.selected_env_ids_finger_tips_ext == 1] >= (self.push_end_time_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1] + self.settling_time_force_finger_tips + self.push_duration_finger_tips_ext[self.selected_env_ids_finger_tips_ext == 1]).type(torch.int32)]                                        
                 if env_ids_to_reset.nelement() > 0:
                     self.selected_env_ids_finger_tips_ext[env_ids_to_reset] = 0
-                    self.force_target_finger_tips_ext[env_ids_to_reset, :3] = 0.
+                    self.force_target_finger_tips_ext[env_ids_to_reset,:,:3] = 0.
                     self.push_end_time_finger_tips_ext[env_ids_to_reset] = 0.
                     self.push_duration_finger_tips_ext[env_ids_to_reset] = 0.
                     self.push_interval_finger_tips_ext[env_ids_to_reset, 0] = torch.randint(int(self.push_interval_finger_tips_ext_min), int(self.push_interval_finger_tips_ext_max), (len(env_ids_to_reset), 1), device=self.device)[:, 0]
                     
             self.selected_env_ids_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0
-            self.force_target_finger_tips_ext[self.freed_envs_finger_tips_ext, :3] = 0.
+            self.force_target_finger_tips_ext[self.freed_envs_finger_tips_ext,:, :3] = 0.
             self.push_end_time_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0.
             self.push_duration_finger_tips_ext[self.freed_envs_finger_tips_ext] = 0. 
-            
-            self.forces[self.freed_envs_finger_tips_ext, self.finger_tips_idx, :3] = 0
+
+            freed_envs_finger_tips_ext_reshaped = torch.nonzero(self.freed_envs_finger_tips_ext).squeeze(1)
+            self.forces[freed_envs_finger_tips_ext_reshaped[:, None], self.finger_tips_idx, :3] = 0
 
             
 
@@ -1574,47 +1816,47 @@ class WujiRobot_pos_force(BaseTask):
 
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
         self.rigid_state = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, -1, 13)
-        self.sensors_forces = gymtorch.wrap_tensor(force_tensor).view(self.num_envs, -1, 6)
+        # self.sensors_forces = gymtorch.wrap_tensor(force_tensor).view(self.num_envs, -1, 6) # shape: num_envs, num_sensors, xyz axis
 
-        # 记得添加其他sensor
-        self.sensors_world = torch.zeros(self.num_envs, 1, 7, device=self.device) # pos(3) + orn(4)
-        for i in range(1):
-            # breakpoint()
-            link_pos = self.rigid_state[:, self.finger_tips_idx,:3]
-            link_q = self.rigid_state[:, self.finger_tips_idx,3:7]
-            offset = self.sensors_pos_link[i, :3].view(1, 1, 3)   # (1,1,3)
-            offset = offset.expand_as(link_pos)     
-            self.sensors_world[:, i, :3] = (link_pos + offset).squeeze(1)            
+        # # 记得添加其他sensor
+        # self.sensors_world = torch.zeros(self.num_envs, len(self.finger_tips_idx), 7, device=self.device) # pos(3) + orn(4)
+        # for i in range(len(self.finger_tips_idx)):
+        #     tip_idx = self.finger_tips_idx[i]
+        #     link_pos = self.rigid_state[:, tip_idx,:3] # shape: num_envs, 3
+        #     link_q = self.rigid_state[:, tip_idx,3:7]
+        #     offset = self.sensors_pos_link[i, :3]
+        #     offset = offset.expand_as(link_pos)     
+        #     self.sensors_world[:, i, :3] = (link_pos + offset).squeeze(1)          
 
-            q_rel = self.sensors_pos_link[i, 3:7].reshape(1, 1, 4)  # (1,1,4)
-            self.sensors_world[:, i, 3:7] = quat_mul(link_q , q_rel).squeeze(1)
+        #     q_rel = self.sensors_pos_link[i, 3:7] 
+        #     self.sensors_world[:, i, 3:7] = quat_mul(link_q , q_rel).squeeze(1)
 
         # # ee info
-        self.finger_tips_pos = self.rigid_state[:, self.finger_tips_idx, :3]
-        self.finger_tips_orn = self.rigid_state[:, self.finger_tips_idx, 3:7]
+        self.finger_tips_pos = self.rigid_state[:, self.finger_tips_idx, :3] # shape: num_envs, num_finger_tips, 3
+        self.finger_tips_orn = self.rigid_state[:, self.finger_tips_idx, 3:7] # shape: num_envs, num_finger_tips, 4
 
-        self.grasp_offset = self.cfg.arm.grasp_offset
+        # self.grasp_offset = self.cfg.arm.grasp_offset
 
-        # target_ee info
+        # target_ee info 一只手5个finger_tips同时开始同时结束
         self.traj_timesteps = torch_rand_float(self.cfg.goal_ee.traj_time[0], self.cfg.goal_ee.traj_time[1], (self.num_envs, 1), device=self.device).squeeze(1) / self.dt
-        self.traj_total_timesteps = self.traj_timesteps + torch_rand_float(self.cfg.goal_ee.hold_time[0], self.cfg.goal_ee.hold_time[1], (self.num_envs, 1), device=self.device).squeeze(1) / self.dt
+        self.traj_total_timesteps = self.traj_timesteps + torch_rand_float(self.cfg.goal_ee.hold_time[0], self.cfg.goal_ee.hold_time[1], (self.num_envs, 1), device=self.device) / self.dt
         self.goal_timer = torch.zeros(self.num_envs, device=self.device)
 
-        self.finger_tip_start_cart =torch.zeros(self.num_envs, 3, device=self.device)
-        self.finger_tip_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
-        self.curr_finger_tip_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
-        self.init_start_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_start, device=self.device,dtype = torch.float).unsqueeze(0)
-        self.init_end_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_end, device=self.device,dtype = torch.float).unsqueeze(0)
+        self.finger_tip_start_cart =torch.zeros(self.num_envs, len(self.finger_tips_idx), 3, device=self.device)
+        self.finger_tip_goal_cart = torch.zeros(self.num_envs, len(self.finger_tips_idx), 3, device=self.device)
+        self.curr_finger_tip_goal_cart = torch.zeros(self.num_envs, len(self.finger_tips_idx), 3, device=self.device)
+        self.init_start_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_start, device=self.device,dtype = torch.float).repeat(self.num_envs, len(self.finger_tips_idx), 3)
+        self.init_end_finger_tip_cart = torch.tensor(self.cfg.goal_ee.ranges.init_pos_end, device=self.device,dtype = torch.float).repeat(self.num_envs, len(self.finger_tips_idx), 3)
 
         # x,y,z,ws (初始化为单位四元数 [0, 0, 0, 1])
-        self.finger_tip_start_orn = torch.zeros(self.num_envs, 4, device=self.device)
-        self.finger_tip_start_orn[:, 3] = 1.0  # w = 1
-        self.finger_tip_goal_orn = torch.zeros(self.num_envs, 4, device=self.device)
-        self.finger_tip_goal_orn[:, 3] = 1.0  # w = 1
-        self.curr_finger_tip_goal_orn = torch.zeros(self.num_envs, 4, device=self.device)
-        self.curr_finger_tip_goal_orn[:, 3] = 1.0  # w = 1
-        self.init_start_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).unsqueeze(0)
-        self.init_end_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).unsqueeze(0)
+        self.finger_tip_start_orn = torch.zeros(self.num_envs,len(self.finger_tips_idx), 4, device=self.device)
+        self.finger_tip_start_orn[:,:, 3] = 1.0  # w = 1
+        self.finger_tip_goal_orn = torch.zeros(self.num_envs,len(self.finger_tips_idx), 4, device=self.device)
+        self.finger_tip_goal_orn[:,:, 3] = 1.0  # w = 1
+        self.curr_finger_tip_goal_orn = torch.zeros(self.num_envs,len(self.finger_tips_idx), 4, device=self.device)
+        self.curr_finger_tip_goal_orn[:,:, 3] = 1.0  # w = 1
+        self.init_start_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).repeat(self.num_envs, 4)
+        self.init_end_finger_tip_orn = torch.tensor(self.cfg.arm.init_target_ee_orn, device=self.device).repeat(self.num_envs, 4)
         # self.curr_finger_tip_goal_cart = self.init_start_finger_tip_cart
         # self.ee_goal_cart = torch.zeros(self.num_envs, 3, device=self.device)
         # self.ee_goal_sphere = torch.zeros(self.num_envs, 3, device=self.device)
@@ -1646,7 +1888,7 @@ class WujiRobot_pos_force(BaseTask):
         # self.curr_ee_goal_cart_world = self.get_ee_goal_spherical_center() + quat_apply(self.base_yaw_quat, self.curr_ee_goal_cart)
 
         # initialize some data used later on
-        self.gripper_force_kps = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.gripper_force_kps = torch.zeros(self.num_envs, len(self.finger_tips_idx), 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.common_step_counter = 0
         self.extras = {}
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
@@ -1657,7 +1899,7 @@ class WujiRobot_pos_force(BaseTask):
         self.last_rigid_state = torch.zeros_like(self.rigid_state)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
 
-        self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
+        self.commands = torch.zeros(self.num_envs, len(self.finger_tips_idx), self.cfg.commands.num_commands_per_finger_tip, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, yaw vel, heading
         # self.commands_scale = torch.tensor([self.obs_scales.lin_vel, 
         #                                     self.obs_scales.lin_vel, 
         #                                     self.obs_scales.ang_vel,
@@ -1693,6 +1935,27 @@ class WujiRobot_pos_force(BaseTask):
         for _ in range(self.cfg.env.c_frame_stack):
             self.critic_history.append(torch.zeros(
                 self.num_envs, self.cfg.env.single_num_privileged_obs, dtype=torch.float, device=self.device))
+        
+        # 实时绘图数据缓冲区（用于记录 forces 和 sensor_forces）
+        self.plot_history_length = 1000  # 记录最近1000步的数据
+        self.forces_history = deque(maxlen=self.plot_history_length)  # 存储 forces[0,1,0:3]
+        self.cmd_forces_history = deque(maxlen=self.plot_history_length)  # 存储 sensors_forces[0,1,0:3]
+        self.step_history = deque(maxlen=self.plot_history_length)  # 存储步数
+        
+        # 初始化 matplotlib 实时绘图
+        self.enable_realtime_plot = False  # 可以通过这个开关控制是否绘图
+        if self.enable_realtime_plot and not self.headless:
+            plt.ion()  # 开启交互模式
+            self.fig, self.axes = plt.subplots(3, 1, figsize=(12, 10))
+            self.fig.suptitle('Forces and Sensor Forces (Env 0, Finger 1)', fontsize=14)
+            self.axes[0].set_title('X Component')
+            self.axes[0].set_ylabel('Force (N)')
+            self.axes[1].set_title('Y Component')
+            self.axes[1].set_ylabel('Force (N)')
+            self.axes[2].set_title('Z Component')
+            self.axes[2].set_ylabel('Force (N)')
+            self.axes[2].set_xlabel('Step')
+            plt.tight_layout()
 
         # joint positions offsets and PD gains
         self.default_dof_pos = 0.5* torch.ones(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -1719,11 +1982,11 @@ class WujiRobot_pos_force(BaseTask):
         self.settling_time_force_finger_tips_ext_s = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
 
         #需要对外界表现出的力 现在只有食指
-        self.force_target_finger_tips_cmd = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
-        self.force_target_finger_tips_ext = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
-        self.current_Fxyz_finger_tips_cmd = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
-
-        # 当前需要主动施加的外力
+        self.force_target_finger_tips_cmd = torch.zeros(self.num_envs,len(self.finger_tips_idx), 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.current_Fxyz_finger_tips_cmd_local = torch.zeros(self.num_envs,len(self.finger_tips_idx), 3, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # 当前需要对手指主动施加的外力
+        self.force_target_finger_tips_ext = torch.zeros(self.num_envs,len(self.finger_tips_idx), 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.forces = torch.zeros(self.num_envs, self.num_bodies, 6, dtype=torch.float, device=self.device,
                                    requires_grad=False)
         # self.forces_local = torch.zeros(self.num_envs, self.num_bodies, 6, dtype=torch.float, device=self.device,
@@ -1828,6 +2091,11 @@ class WujiRobot_pos_force(BaseTask):
         self.pinocchio_model = robot.model
         self.pinocchio_data = self.pinocchio_model.createData()
         self.pinocchio_tips_idx = [
+                                    # self.pinocchio_model.getFrameId("fingertip_thumb"),
+                                    # self.pinocchio_model.getFrameId("fingertip_index"),
+                                    # self.pinocchio_model.getFrameId("fingertip_middle"),
+                                    # self.pinocchio_model.getFrameId("fingertip_ring"),
+                                    # self.pinocchio_model.getFrameId("fingertip_pinky"),
                                     self.pinocchio_model.getFrameId("finger1_tip_link"),
                                     self.pinocchio_model.getFrameId("finger2_tip_link"),
                                     self.pinocchio_model.getFrameId("finger3_tip_link"),
@@ -1840,9 +2108,9 @@ class WujiRobot_pos_force(BaseTask):
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         self.body_names_to_idx = self.gym.get_asset_rigid_body_dict(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
-
         # self.finger_tips_idx = [self.body_names_to_idx[i] for i in self.cfg.asset.finger_tip_name]
-        self.finger_tips_idx = [10]
+        self.finger_tips_idx = [5,10,15,20,25]
+        self.finger_tips_idx = torch.tensor(self.finger_tips_idx, dtype=torch.long, device=self.device)
 
         self.robot_palm_idx = [index for index, body_name in enumerate(body_names) if body_name == "palm_link"][0]
         self.num_bodies = len(body_names)
@@ -1869,25 +2137,25 @@ class WujiRobot_pos_force(BaseTask):
 
         self.sensors_pos_link = torch.zeros(len(self.finger_tips_idx), 7, dtype=torch.float32, device=self.device) # x,y,z,(x,y,z,w)
         
-        ##这里记得写入其他的sensor
-        self.sensors_pos_link[0] = torch.tensor([0.,0.,0.,0,0,0,1], dtype=torch.float32, device=self.device)
+        # # sensor相对于tip_link的坐标
+        # self.sensors_pos_link = torch.tensor([[0.,0.,0.,0,0,0,1] for _ in range(len(self.finger_tips_idx))], dtype=torch.float32, device=self.device)
 
 
         self.env_frictions = torch.zeros(self.num_envs, 1, dtype=torch.float32, device=self.device)
 
         self.mass_params_tensor = torch.zeros(self.num_envs, 22, dtype=torch.float, device=self.device, requires_grad=False)
         
-        # add tactile sensor on the finger tip现在只有食指
-        for i,tips_idx in enumerate(self.finger_tips_idx):
-            p = gymapi.Vec3(self.sensors_pos_link[i][0], self.sensors_pos_link[i][1], self.sensors_pos_link[i][2])
-            q = gymapi.Quat(self.sensors_pos_link[i][3], self.sensors_pos_link[i][4], self.sensors_pos_link[i][5], self.sensors_pos_link[i][6])
-            sensor_pose = gymapi.Transform(
-                p=p,
-                r=q
-            )
-            sensor_props = gymapi.ForceSensorProperties()
-            sensor_props.use_world_frame = False
-            self.gym.create_asset_force_sensor(robot_asset, tips_idx, sensor_pose,sensor_props)
+        # # add tactile sensor on the finger tips
+        # for i,tips_idx in enumerate(self.finger_tips_idx):
+        #     p = gymapi.Vec3(self.sensors_pos_link[i][0], self.sensors_pos_link[i][1], self.sensors_pos_link[i][2])
+        #     q = gymapi.Quat(self.sensors_pos_link[i][3], self.sensors_pos_link[i][4], self.sensors_pos_link[i][5], self.sensors_pos_link[i][6])
+        #     sensor_pose = gymapi.Transform(
+        #         p=p,
+        #         r=q
+        #     )
+        #     sensor_props = gymapi.ForceSensorProperties()
+        #     sensor_props.use_world_frame = False
+        #     self.gym.create_asset_force_sensor(robot_asset, tips_idx, sensor_pose,sensor_props)
         
         for i in range(self.num_envs):
 
@@ -1906,10 +2174,10 @@ class WujiRobot_pos_force(BaseTask):
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
 
 
-            num_sensors = self.gym.get_actor_force_sensor_count(env_handle, actor_handle)
-            for sensor_idx in range(num_sensors):
-                sensor = self.gym.get_actor_force_sensor(env_handle, actor_handle, sensor_idx)
-                self.sensors_handle[i].append(sensor)
+            # num_sensors = self.gym.get_actor_force_sensor_count(env_handle, actor_handle)
+            # for sensor_idx in range(num_sensors):
+            #     sensor = self.gym.get_actor_force_sensor(env_handle, actor_handle, sensor_idx)
+            #     self.sensors_handle[i].append(sensor)
             self.mass_params_tensor[i, :] = torch.from_numpy(mass_params).to(self.device)
 
             self.envs.append(env_handle)
@@ -2007,6 +2275,13 @@ class WujiRobot_pos_force(BaseTask):
 
 
     def _pinocchio_forward_kinematics(self, q, env_ids=None):
+        """
+        使用Pinocchio进行正向运动学计算，计算所有手指的位置和姿态
+        
+        Args:
+            q: 关节角度，形状为 (num_envs, num_dofs)
+            env_ids: 需要计算的环境ID列表
+        """
         if len(env_ids)==0 :
             return 
         for i in range(len(env_ids)):
@@ -2015,16 +2290,52 @@ class WujiRobot_pos_force(BaseTask):
             pin.forwardKinematics(self.pinocchio_model, self.pinocchio_data, q_i)
             pin.updateFramePlacements(self.pinocchio_model, self.pinocchio_data)
 
-            # 仅有食指
-            # translation
-            index_tip_goal_cart_base = self.pinocchio_data.oMf[self.pinocchio_tips_idx[1]].translation.copy()
-            self.finger_tip_goal_cart[idx] = torch.from_numpy(index_tip_goal_cart_base).to(self.device, dtype=torch.float32)
-            # rotation
-            index_tip_goal_rotation_base = self.pinocchio_data.oMf[self.pinocchio_tips_idx[1]].rotation.copy() # 3*3 matrix
-            R_tensor = torch.from_numpy(index_tip_goal_rotation_base).to(self.device, dtype=torch.float32)
-            R_tensor = R_tensor.unsqueeze(0)
-            index_tip_goal_orn_base = mat3x3_to_xyzw(R_tensor).squeeze(0)  # (1, 4) -> (4,)
-            self.finger_tip_goal_orn[idx] = index_tip_goal_orn_base 
+            # 计算所有5个手指的位置和姿态
+            for finger_idx in range(len(self.pinocchio_tips_idx)):
+                pinocchio_tip_frame_idx = self.pinocchio_tips_idx[finger_idx]
+                tip_link_idx = self.finger_tips_idx[finger_idx]
+                # translation
+                tip_goal_cart_base = self.pinocchio_data.oMf[pinocchio_tip_frame_idx].translation.copy()
+                self.finger_tip_goal_cart[idx, finger_idx] = torch.from_numpy(tip_goal_cart_base).to(self.device, dtype=torch.float32)
+                # rotation
+                tip_goal_rotation_base = self.pinocchio_data.oMf[pinocchio_tip_frame_idx].rotation.copy() # 3*3 matrix
+                R_tensor = torch.from_numpy(tip_goal_rotation_base).to(self.device, dtype=torch.float32)
+                R_tensor = R_tensor.unsqueeze(0)
+                tip_goal_orn_base = mat3x3_to_xyzw(R_tensor).squeeze(0)  # (1, 4) -> (4,)
+                self.finger_tip_goal_orn[idx, finger_idx] = tip_goal_orn_base
+    
+    def _check_finger_self_collision(self, env_ids, min_distance=0.005):
+        """
+        检查手指之间是否发生自碰撞
+        
+        Args:
+            env_ids: 需要检查的环境ID列表
+            min_distance: 手指之间的最小安全距离（米），默认0.02m
+        
+        Returns:
+            collision_mask: 布尔张量，True表示无碰撞，False表示有碰撞
+        """
+        if len(env_ids) == 0:
+            return torch.tensor([], dtype=torch.bool, device=self.device)
+        
+        # 获取所有手指的位置 (len(env_ids), num_fingers, 3)
+        finger_positions = self.finger_tip_goal_cart[env_ids]  # shape: (len(env_ids), 5, 3)
+        num_fingers = finger_positions.shape[1]
+        
+        # 计算所有手指对之间的距离
+        collision_mask = torch.ones(len(env_ids), dtype=torch.bool, device=self.device)
+        
+        for i in range(num_fingers):
+            for j in range(i + 1, num_fingers):
+                # 计算手指i和手指j之间的距离
+                pos_i = finger_positions[:, i, :]  # (len(env_ids), 3)
+                pos_j = finger_positions[:, j, :]  # (len(env_ids), 3)
+                distances = torch.norm(pos_i - pos_j, dim=1)  # (len(env_ids),)
+                
+                # 如果距离小于最小安全距离，则认为发生碰撞
+                collision_mask = collision_mask & (distances >= min_distance)
+        
+        return collision_mask 
 
 
     # def compute_ref_state(self):
@@ -2093,6 +2404,80 @@ class WujiRobot_pos_force(BaseTask):
         # print(evt.action, self.commands)
 
         
+    
+    def transform_force_finger_tip_local_to_base(self, forces_local):
+        """
+        将 finger_tip local 坐标系的力转换到 base 坐标系
+        
+        Args:
+            forces_local: (num_envs, num_fingers, 3) - finger_tip local 坐标系
+        
+        Returns:
+            forces_base: (num_envs, num_fingers, 3) - base 坐标系
+        """
+        num_fingers = forces_local.shape[1]
+        finger_tip_quat = self.rigid_state[:, self.finger_tips_idx, 3:7]
+        base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4).reshape(self.num_envs*num_fingers,4)
+        
+        # finger_tip local -> world
+        forces_world = quat_apply(
+            finger_tip_quat,
+            forces_local.reshape(-1, 3)
+        ).reshape(self.num_envs, num_fingers, 3)
+        
+        # world -> base
+        forces_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            forces_world.reshape(-1, 3)
+        ).reshape(self.num_envs, num_fingers, 3)
+        
+        return forces_base
+
+    def transform_force_base_to_world(self, forces_base):
+        """
+        将 base 坐标系的力转换到 world 坐标系（用于可视化）
+        
+        Args:
+            forces_base: (num_envs, num_fingers, 3) - base 坐标系
+        
+        Returns:
+            forces_world: (num_envs, num_fingers, 3) - world 坐标系
+        """
+        assert forces_base.shape == (self.num_envs, len(self.finger_tips_idx), 3)
+        num_fingers = forces_base.shape[1]
+        base_quat_expanded = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4)
+        
+        forces_world = quat_apply(
+            base_quat_expanded.reshape(-1, 4),
+            forces_base.reshape(-1, 3)
+        ).reshape(self.num_envs, num_fingers, 3)
+        
+        return forces_world
+
+    def transform_pos_base_to_world(self, pos_base):
+        """
+        将 base 坐标系的位置转换到 world 坐标系（用于可视化）
+        
+        Args:
+            pos_base: (num_envs, num_fingers, 3) - base 坐标系
+        
+        Returns:
+            pos_world: (num_envs, num_fingers, 3) - world 坐标系
+        """
+        assert pos_base.shape == (self.num_envs, len(self.finger_tips_idx), 3)
+        num_fingers = pos_base.shape[1]
+        base_quat_expanded = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4)
+        
+        # 将 base 坐标系的位置向量旋转到 world 坐标系的方向
+        pos_world_rotated = quat_apply(
+            base_quat_expanded.reshape(-1, 4),
+            pos_base.reshape(-1, 3)
+        ).reshape(self.num_envs, num_fingers, 3)
+        
+        # 加上 base 在 world 坐标系中的位置，得到绝对位置
+        pos_world = pos_world_rotated + self.base_pos.unsqueeze(1)
+        
+        return pos_world
 
     #------------ reward functions----------------
     # def _reward_tracking_ee_world(self):
@@ -2102,84 +2487,316 @@ class WujiRobot_pos_force(BaseTask):
     #     rew = torch.exp(-ee_pos_error/self.cfg.rewards.tracking_ee_sigma * 2)
     #     return rew
     
+
+    # 为每根手指都添加pos_track和orn_track奖励
+    def _reward_tracking_ee_position_base_finger0(self):
+        """
+        Args:
+            finger_idx: int, 手指索引 0, 1 2 3 4
+        Returns:
+            rew: tensor of shape (num_envs,)  奖励值
+        """
+        finger_idx = 0
+
+        base_quat_reshaped = self.base_quat
+        finger_idx_in_isaac = self.finger_tips_idx[finger_idx]
+
+        forces_local = self.forces[:, finger_idx_in_isaac, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local[:, finger_idx, :3].clone()  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+        
+        forces_offset_world = quat_apply(self.rigid_state[:, finger_idx_in_isaac, 3:7].clone(), forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(base_quat_reshaped, forces_offset_world)
+
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps[:,finger_idx]) + self.curr_finger_tip_goal_cart[:, finger_idx].clone()   
+        
+
+        finger_tip_pos_world = self.rigid_state[:, finger_idx_in_isaac, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos)
+        ).reshape(self.num_envs, 3)
+        
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger0
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        return rew
+
+    def _reward_tracking_ee_position_base_finger1(self):
+        """
+        Args:
+            finger_idx: int, 手指索引 0, 1 2 3 4
+        Returns:
+            rew: tensor of shape (num_envs,)  奖励值
+        """
+        finger_idx = 1
+
+        base_quat_reshaped = self.base_quat
+        finger_idx_in_isaac = self.finger_tips_idx[finger_idx]
+
+        forces_local = self.forces[:, finger_idx_in_isaac, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local[:, finger_idx, :3].clone()  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+        
+        forces_offset_world = quat_apply(self.rigid_state[:, finger_idx_in_isaac, 3:7].clone(), forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(base_quat_reshaped, forces_offset_world)
+        
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps[:,finger_idx]) + self.curr_finger_tip_goal_cart[:, finger_idx].clone()   
+        
+
+        finger_tip_pos_world = self.rigid_state[:, finger_idx_in_isaac, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos)
+        ).reshape(self.num_envs, 3)
+        
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger1
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        return rew
+    
+    def _reward_tracking_ee_position_base_finger2(self):
+        """
+        Args:
+            finger_idx: int, 手指索引 0, 1 2 3 4
+        Returns:
+            rew: tensor of shape (num_envs,)  奖励值
+        """
+        finger_idx = 2
+
+        base_quat_reshaped = self.base_quat
+        finger_idx_in_isaac = self.finger_tips_idx[finger_idx]
+
+        forces_local = self.forces[:, finger_idx_in_isaac, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local[:, finger_idx, :3].clone()  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+        
+        forces_offset_world = quat_apply(self.rigid_state[:, finger_idx_in_isaac, 3:7].clone(), forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(base_quat_reshaped, forces_offset_world)
+        
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps[:,finger_idx]) + self.curr_finger_tip_goal_cart[:, finger_idx].clone()   
+        
+
+        finger_tip_pos_world = self.rigid_state[:, finger_idx_in_isaac, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos)
+        ).reshape(self.num_envs, 3)
+        
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger2
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        return rew
+    
+    def _reward_tracking_ee_position_base_finger3(self):
+        """
+        Args:
+            finger_idx: int, 手指索引 0, 1 2 3 4
+        Returns:
+            rew: tensor of shape (num_envs,)  奖励值
+        """
+        finger_idx = 3
+
+        base_quat_reshaped = self.base_quat
+        finger_idx_in_isaac = self.finger_tips_idx[finger_idx]
+
+        forces_local = self.forces[:, finger_idx_in_isaac, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local[:, finger_idx, :3].clone()  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+        
+        forces_offset_world = quat_apply(self.rigid_state[:, finger_idx_in_isaac, 3:7].clone(), forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(base_quat_reshaped, forces_offset_world)
+        
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps[:,finger_idx]) + self.curr_finger_tip_goal_cart[:, finger_idx].clone()   
+        
+
+        finger_tip_pos_world = self.rigid_state[:, finger_idx_in_isaac, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos)
+        ).reshape(self.num_envs, 3)
+        
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger3
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        return rew
+    
+    def _reward_tracking_ee_position_base_finger4(self):
+        """
+        Args:
+            finger_idx: int, 手指索引 0, 1 2 3 4
+        Returns:
+            rew: tensor of shape (num_envs,)  奖励值
+        """
+        finger_idx = 4
+
+        base_quat_reshaped = self.base_quat
+        finger_idx_in_isaac = self.finger_tips_idx[finger_idx]
+
+        forces_local = self.forces[:, finger_idx_in_isaac, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local[:, finger_idx, :3].clone()  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+        
+        forces_offset_world = quat_apply(self.rigid_state[:, finger_idx_in_isaac, 3:7].clone(), forces_offset_local)
+        forces_offset_base = quat_rotate_inverse(base_quat_reshaped, forces_offset_world)
+        
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps[:,finger_idx]) + self.curr_finger_tip_goal_cart[:, finger_idx].clone()   
+        
+
+        finger_tip_pos_world = self.rigid_state[:, finger_idx_in_isaac, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos)
+        ).reshape(self.num_envs, 3)
+        
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger4
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        rew = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        return rew
+        
     def _reward_tracking_ee_orientation_6d_base(self):
         """
-        6D旋转追踪奖励（自适应参数版本）
-        
-        Args:
-            mat6d_ee: tensor of shape (num_envs, 6)  当前姿态的6D表示
-            mat6d_target: tensor of shape (num_envs, 6)  目标姿态的6D表示
+        6D旋转追踪奖励（支持多手指版本）
+        对每个手指分别计算姿态跟踪奖励，然后取平均
         
         Returns:
             reward: tensor of shape (num_envs,)  奖励值
         """
+        num_fingers = len(self.finger_tips_idx)
         # 获取当前指尖姿态（世界坐标系）
-        finger_tip_orn_quat_world = self.rigid_state[:, self.finger_tips_idx, 3:7].clone().squeeze(1)
+        base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4).reshape(self.num_envs*num_fingers,4)
+        finger_tip_orn_quat_world = self.rigid_state[:, self.finger_tips_idx, 3:7].clone()
+
         # 转换到base坐标系
-        finger_tip_orn_quat_base = quat_mul(quat_conjugate(self.base_quat), finger_tip_orn_quat_world)
-        # 归一化四元数（防止NaN）
-        finger_tip_orn_quat_base = finger_tip_orn_quat_base / (torch.norm(finger_tip_orn_quat_base, dim=-1, keepdim=True) + 1e-8)
+        finger_tip_orn_quat_base = quat_mul(quat_conjugate(base_quat_reshaped), finger_tip_orn_quat_world.reshape(self.num_envs*num_fingers,4)).reshape(self.num_envs, num_fingers, 4)
+        # # 归一化四元数（防止NaN）
+        # finger_tip_orn_quat_base = finger_tip_orn_quat_base / (torch.norm(finger_tip_orn_quat_base, dim=-1, keepdim=True) + 1e-8)
         
-        # 获取目标姿态（已经在base坐标系）
+        # 获取目标姿态（已经在base坐标系）shape: (num_envs, num_fingers, 4)
         curr_finger_tip_goal_quat_base = self.curr_finger_tip_goal_orn.clone()
-        # 归一化四元数（防止NaN）
-        curr_finger_tip_goal_quat_base = curr_finger_tip_goal_quat_base / (torch.norm(curr_finger_tip_goal_quat_base, dim=-1, keepdim=True) + 1e-8)
-        
-        # 转换为6D表示
+        # # 归一化四元数（防止NaN）
+        # curr_finger_tip_goal_quat_base = curr_finger_tip_goal_quat_base / (torch.norm(curr_finger_tip_goal_quat_base, dim=-1, keepdim=True) + 1e-8)
+
+        # 转换为6D表示 shape: (num_envs, num_fingers, 6)
         mat6d_ee_base = quat_to_mat6d(finger_tip_orn_quat_base)
         mat6d_target_base = quat_to_mat6d(curr_finger_tip_goal_quat_base)
         
-        # 1. 计算6D误差的L2距离平方和
-        diff = torch.sum((mat6d_ee_base - mat6d_target_base)**2, dim=-1)
-        
-        # 2. 自适应阈值参数
-        # 6D误差的理论最大值约为4.0（两个单位向量完全相反时）
-        # 但实际中，合理的误差范围通常在 [0, 2.0] 之间
-        # 我们使用理论最大值的一部分作为自适应阈值
-        diff_max_theoretical = 4.0  # 理论最大值
-        diff_threshold_ratio = 0.1   # 阈值比例（可配置）
-        adaptive_threshold = diff_max_theoretical * diff_threshold_ratio  # 约0.4
-        
-        # 3. 自适应缩放因子（基于误差大小）
-        # 误差越小，sigma越小（奖励曲线更陡），鼓励精确贴合
-        # 误差越大，sigma越大（奖励曲线更平缓），避免过度惩罚
-        # sigma_scale 范围: [0.3, 1.0]
-        # - diff → 0 时，sigma_scale → 0.3（最小sigma，最陡曲线）
-        # - diff → ∞ 时，sigma_scale → 1.0（最大sigma，最平缓曲线）
-        sigma_scale = 0.3 + 0.7 * (diff / (diff + adaptive_threshold))
-        
-        # 4. 自适应sigma值
-        # 与位置追踪奖励保持一致的形式
-        base_sigma = self.cfg.rewards.tracking_ee_orn_sigma
-        # sigma范围: [base_sigma * 0.3, base_sigma * 1.0]
-        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3, max=base_sigma * 1.0)
-        
-        rew = torch.exp(-adaptive_sigma * diff)
-        return rew
-
-    def _reward_tracking_ee_force_base(self):
-        forces_local = self.sensors_forces[:, 0, :3]
-        forces_cmd_local = self.current_Fxyz_finger_tips_cmd
-        forces_offset_local = (forces_local + forces_cmd_local)
-
-        forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone().squeeze(1), forces_offset_local)
-        # forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
-        forces_offset_base = quat_rotate_inverse(self.base_quat, forces_offset_global)
-
-
-        curr_ee_goal_cart_base_offset = forces_offset_base / self.gripper_force_kps + self.curr_finger_tip_goal_cart
-       
-        finger_tip_pos_world = self.rigid_state[:,self.finger_tips_idx, :3].clone().squeeze(1)
-        finger_tip_pos_base = quat_rotate_inverse(self.base_quat, finger_tip_pos_world-self.base_pos)
-
-        ee_pos_error = torch.sum(torch.abs(finger_tip_pos_base.squeeze(1) - curr_ee_goal_cart_base_offset), dim=1)
+        # 计算每个手指的6D误差的L2距离平方和 shape: (num_envs, num_fingers)
+        diff_per_finger = torch.sum((mat6d_ee_base - mat6d_target_base)**2, dim=-1)
         
         # 自适应 sigma：误差越小，sigma 越小（奖励曲线更陡），鼓励精确贴合
-        base_sigma = self.cfg.rewards.tracking_ee_sigma
-        sigma_scale = 0.3 + 0.7 * (ee_pos_error / (ee_pos_error + 1.0))  # err→0 时约 0.3，err 大时→1.0
+        base_sigma = self.cfg.rewards.scales.tracking_ee_position_base_finger4
+        sigma_scale = 0.3 + 0.7 * (diff_per_finger / (diff_per_finger + 1.0))  # err→0 时约 0.3，err 大时→1.0
         adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
 
-        rew = torch.exp(-ee_pos_error / (adaptive_sigma + 1e-6) * 2)
+        rew = torch.exp(-diff_per_finger / (adaptive_sigma + 1e-6) * 2)
+        rew = torch.mean(rew, dim=-1)
+        return rew
+        
+
+    def _reward_tracking_ee_force_base(self):
+        """
+        位置和力跟踪奖励（支持多手指版本）
+        对每个手指分别计算位置跟踪奖励，然后取平均
+        
+        Returns:
+            reward: tensor of shape (num_envs,)  奖励值
+        """
+        num_fingers = len(self.finger_tips_idx)
+        base_quat_reshaped = self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4).reshape(self.num_envs*num_fingers,4)
+        # 获取所有手指的传感器力 shape: (num_envs, num_fingers, 3)
+        # forces_local = self.sensors_forces[:, :, :3]  # shape: (num_envs, num_fingers, 3)
+        forces_local = self.forces[:, self.finger_tips_idx, :3].clone() # 手动施加的外力
+        forces_cmd_local = self.current_Fxyz_finger_tips_cmd_local  # shape: (num_envs, num_fingers, 3)
+        forces_offset_local = (forces_local + forces_cmd_local)
+
+        # forces_offset_global = quat_apply(self.rigid_state[:,self.finger_tips_idx,3:7].clone(), forces_offset_local)
+        # # forces_offset_global = quat_apply(self.base_quat, forces_offset_local)
+        # forces_offset_base = quat_rotate_inverse(
+        #     self.base_quat.unsqueeze(1).expand(self.num_envs, num_fingers, 4).reshape(self.num_envs*num_fingers,4), 
+        #     forces_offset_global.reshape(self.num_envs*num_fingers,3)
+        #     ).reshape(self.num_envs, num_fingers, 3)
+        forces_offset_base = self.transform_force_finger_tip_local_to_base(forces_offset_local)
+
+        # 计算考虑力偏移的目标位置 shape: (num_envs, num_fingers, 3)
+        curr_ee_goal_cart_base_offset = forces_offset_base / (self.gripper_force_kps) + self.curr_finger_tip_goal_cart
+       
+        # 获取当前所有手指的位置 shape: (num_envs, num_fingers, 3)
+        finger_tip_pos_world = self.rigid_state[:, self.finger_tips_idx, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            base_quat_reshaped,
+            (finger_tip_pos_world - self.base_pos.unsqueeze(1)).reshape(self.num_envs*num_fingers,3)
+        ).reshape(self.num_envs, num_fingers, 3)
+        
+        # 计算每个手指的位置误差 shape: (num_envs, num_fingers)
+        ee_pos_error_per_finger = torch.sum(torch.abs(finger_tip_pos_base - curr_ee_goal_cart_base_offset), dim=-1) # shape: (num_envs, num_fingers)
+        
+        # 自适应 sigma：对每个手指分别计算
+        base_sigma = self.cfg.rewards.tracking_ee_sigma
+        sigma_scale = 0.3 + 0.7 * (ee_pos_error_per_finger / (ee_pos_error_per_finger + 1.0))
+        adaptive_sigma = torch.clamp(base_sigma * sigma_scale, min=base_sigma * 0.3)
+
+        # 计算每个手指的奖励 shape: (num_envs, num_fingers)
+        rew_per_finger = torch.exp(-ee_pos_error_per_finger / (adaptive_sigma + 1e-6) * 2)
+        
+        # 对所有手指取平均（也可以使用最小奖励或其他聚合方式）
+        rew = torch.mean(rew_per_finger, dim=-1)  # shape: (num_envs,)
+        
+        return rew
+    
+    def _reward_finger_tracking_consistency(self):
+        """
+        手指跟踪一致性奖励：鼓励所有手指的跟踪误差相近
+        避免某些手指跟踪很好，而其他手指跟踪很差的情况
+        
+        Returns:
+            reward: tensor of shape (num_envs,)  奖励值
+        """
+        num_fingers = len(self.finger_tips_idx)
+        
+        # 计算每个手指的位置跟踪误差
+        finger_tip_pos_world = self.rigid_state[:, self.finger_tips_idx, :3].clone()
+        finger_tip_pos_base = quat_rotate_inverse(
+            self.base_quat.unsqueeze(1).expand(-1, num_fingers, -1).reshape(-1, 4),
+            (finger_tip_pos_world - self.base_pos.unsqueeze(1)).reshape(-1, 3)
+        ).view(self.num_envs, num_fingers, 3)
+        
+        # 计算位置误差 shape: (num_envs, num_fingers)
+        pos_error_per_finger = torch.norm(finger_tip_pos_base - self.curr_finger_tip_goal_cart, dim=-1)
+        
+        # 计算误差的标准差（一致性指标）
+        mean_error = torch.mean(pos_error_per_finger, dim=1, keepdim=True)
+        error_std = torch.std(pos_error_per_finger, dim=1)
+        
+        # 奖励：标准差越小，一致性越好
+        consistency_sigma = 0.05  # 可配置参数
+        rew = torch.exp(-error_std / (consistency_sigma + 1e-6))
+        
         return rew
     
     # def _reward_tracking_ee_force(self):
@@ -2192,7 +2809,7 @@ class WujiRobot_pos_force(BaseTask):
 
     def _reward_dof_vel(self):
         # Penalize dof velocities
-        return torch.sum(torch.square(self.dof_vel)[:, 4:8], dim=1)
+        return torch.sum(torch.square(self.dof_vel)[:, :], dim=1)
 
     def _reward_contact_stability(self):
         """接触稳定性（力的方向稳定性）"""
@@ -2209,7 +2826,7 @@ class WujiRobot_pos_force(BaseTask):
     
     def _reward_dof_acc(self):
         # Penalize dof accelerations
-        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel)[:, 4:8] / self.dt), dim=1)
+        return torch.sum(torch.square((self.last_dof_vel - self.dof_vel)[:, :] / self.dt), dim=1)
     
    
     # def _reward_action_rate(self):
@@ -2221,12 +2838,12 @@ class WujiRobot_pos_force(BaseTask):
         # Penalize dof positions too close to the limit
         out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.) # lower limit
         out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.)
-        return torch.sum(out_of_limits[:,4:8], dim=1)
+        return torch.sum(out_of_limits[:,:], dim=1)
 
     def _reward_dof_vel_limits(self):
         # Penalize dof velocities too close to the limit
         # clip to max error = 1 rad/s per joint to avoid huge penalties
-        return torch.sum((torch.abs(self.dof_vel) - self.dof_vel_limits*self.cfg.rewards.soft_dof_vel_limit).clip(min=0., max=1.)[:, 4:8], dim=1)
+        return torch.sum((torch.abs(self.dof_vel) - self.dof_vel_limits*self.cfg.rewards.soft_dof_vel_limit).clip(min=0., max=1.)[:, :], dim=1)
 
    
     
@@ -2237,44 +2854,63 @@ class WujiRobot_pos_force(BaseTask):
         """
         
         term_1 = torch.sum(torch.square(
-            self.last_actions - self.actions)[:, 4:8], dim=1)
+            self.last_actions - self.actions)[:, :], dim=1)
         term_2 = torch.sum(torch.square(
-            self.actions + self.last_last_actions - 2 * self.last_actions)[:, 4:8], dim=1)
-        term_3 = 0.05 * torch.sum(torch.abs(self.actions)[:, 4:8], dim=1)
+            self.actions + self.last_last_actions - 2 * self.last_actions)[:, :], dim=1)
+        term_3 = 0.05 * torch.sum(torch.abs(self.actions)[:, :], dim=1)
         return term_1 + term_2 + term_3
     
     
     def _reward_ee_force_x(self):
+        # 获取传感器力（finger_tip local）
+        sensor_forces_local = self.sensors_forces[:, :, :3]  # (num_envs, num_fingers, 3)
         
-        xy_forces_local = self.forces[:, self.finger_tips_idx, 0:3]
+        # 转换到 base 坐标系
+        sensor_forces_base = self.transform_force_finger_tip_local_to_base(sensor_forces_local)
         
-        force_magn_meas = (xy_forces_local[:, 0]).view(self.num_envs, 1)
-        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_X]).view(self.num_envs, 1)
-        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
-
+        # 从 commands 获取 F_cmd（已经是 base 坐标系）
+        F_cmd_base = self.commands[:, :, INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]  # (num_envs, num_fingers, 3)
+        
+        # 计算误差（都在 base 坐标系）
+        force_magn_meas = sensor_forces_base[:, :, 0]  # (num_envs, num_fingers)
+        force_magn_cmd = F_cmd_base[:, :, 0]  # (num_envs, num_fingers)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).mean(dim=1)  # (num_envs,) - 对所有手指取平均
+        
         force_magn_coeff = self.cfg.rewards.sigma_force
-        return torch.exp(-force_magn_coeff*force_magn_error)
+        return torch.exp(-force_magn_coeff * force_magn_error)
     
     def _reward_ee_force_y(self):
+        # 获取传感器力（finger_tip local）
+        sensor_forces_local = self.sensors_forces[:, :, :3]  # (num_envs, num_fingers, 3)
         
-        xy_forces_local = self.forces[:, self.finger_tips_idx, 0:3]
-        # base_quat_world = self.base_quat.view(self.num_envs,4)
-        # base_rpy_world = torch.stack(get_euler_xyz(base_quat_world), dim=1)
-        # base_quat_world_indep = quat_from_euler_xyz(0 * base_rpy_world[:, 0], 0 * base_rpy_world[:, 1], base_rpy_world[:, 2])
-        # xy_forces_local = quat_rotate_inverse(base_quat_world_indep, xy_forces_global)
-
-        force_magn_meas = (xy_forces_local[:, 1]).view(self.num_envs, 1)
-        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_Y]).view(self.num_envs, 1)
-        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
-
+        # 转换到 base 坐标系
+        sensor_forces_base = self.transform_force_finger_tip_local_to_base(sensor_forces_local)
+        
+        # 从 commands 获取 F_cmd（已经是 base 坐标系）
+        F_cmd_base = self.commands[:, :, INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]  # (num_envs, num_fingers, 3)
+        
+        # 计算误差（都在 base 坐标系）
+        force_magn_meas = sensor_forces_base[:, :, 1]  # (num_envs, num_fingers)
+        force_magn_cmd = F_cmd_base[:, :, 1]  # (num_envs, num_fingers)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).mean(dim=1)  # (num_envs,) - 对所有手指取平均
+        
         force_magn_coeff = self.cfg.rewards.sigma_force
-        return torch.exp(-force_magn_coeff*force_magn_error)
+        return torch.exp(-force_magn_coeff * force_magn_error)
     
     def _reward_ee_force_z(self):
-
-        force_magn_meas = (self.forces[:, self.finger_tips_idx, 2]).view(self.num_envs, 1)
-        force_magn_cmd = (self.commands[:, INDEX_TIP_FORCE_Z]).view(self.num_envs, 1)
-        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).view(self.num_envs)
-
+        # 获取传感器力（finger_tip local）
+        sensor_forces_local = self.sensors_forces[:, :, :3]  # (num_envs, num_fingers, 3)
+        
+        # 转换到 base 坐标系
+        sensor_forces_base = self.transform_force_finger_tip_local_to_base(sensor_forces_local)
+        
+        # 从 commands 获取 F_cmd（已经是 base 坐标系）
+        F_cmd_base = self.commands[:, :, INDEX_TIP_FORCE_X:(INDEX_TIP_FORCE_Z+1)]  # (num_envs, num_fingers, 3)
+        
+        # 计算误差（都在 base 坐标系）
+        force_magn_meas = sensor_forces_base[:, :, 2]  # (num_envs, num_fingers)
+        force_magn_cmd = F_cmd_base[:, :, 2]  # (num_envs, num_fingers)
+        force_magn_error = torch.abs(force_magn_meas - force_magn_cmd).mean(dim=1)  # (num_envs,) - 对所有手指取平均
+        
         force_magn_coeff = self.cfg.rewards.sigma_force
-        return torch.exp(-force_magn_coeff*force_magn_error)
+        return torch.exp(-force_magn_coeff * force_magn_error)

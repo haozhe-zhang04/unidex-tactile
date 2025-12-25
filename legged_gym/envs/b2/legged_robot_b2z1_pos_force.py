@@ -411,13 +411,13 @@ class LeggedRobot_b2z1_pos_force(BaseTask):
                                     self.forces_local[:, self.robot_base_idx] * self.obs_scales.base_force, # 3
                                     ),dim=-1)
         
-        obs_buf = torch.cat(( #self.get_body_orientation(),  # dim 2
-                                    #self.base_ang_vel * self.obs_scales.ang_vel,  # dim 3
+        obs_buf = torch.cat(( self.get_body_orientation(),  # dim 2
+                                    self.base_ang_vel * self.obs_scales.ang_vel,  # dim 3
                                     ((self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos)[:, :-self.cfg.env.num_gripper_joints], # dim 17
                                     (self.dof_vel * self.obs_scales.dof_vel)[:, :-self.cfg.env.num_gripper_joints], # dim 17
                                     self.actions[:, :17], # dim 17
-                                    #sin_pos, # 1
-                                    #cos_pos, # 1
+                                    sin_pos, # 1
+                                    cos_pos, # 1
                                     (self.commands * self.commands_scale)[:, :15], # dim 15
                                     ),dim=-1)
         

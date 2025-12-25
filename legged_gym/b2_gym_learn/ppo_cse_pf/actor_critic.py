@@ -11,9 +11,9 @@ class AC_Args(PrefixProto, cli=False):
     adaptation_module_decoder_hidden_dims = [128, 64]
     
     # 注意: 维度必须与 obs_pred 匹配 (sensor_forces:3 + dof_pos:4 + finger_tip_vel:3 + forces_error:3 = 13)
-    adaptation_labels = ["sensor_force_loss", "dof_pos_loss", "finger_tip_vel_loss", "force_error_loss"]
-    adaptation_dims = [3, 4, 3, 3]  # 总和=13，与obs_pred维度匹配
-    adaptation_weights = [1.0, 0.5, 0.5, 1.0]
+    adaptation_labels = ["finger_tip_vel_base"]
+    adaptation_dims = [15]
+    adaptation_weights = [1.0]
 
 
 class ActorCritic(nn.Module):
