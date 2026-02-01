@@ -3,7 +3,7 @@ import pinocchio as pin
 import numpy as np
 import os
 import torch
-
+from pinocchio.visualize import MeshcatVisualizer
 # 旋转矩阵转换为四元数
 def mat3x3_to_quat(R):
     """
@@ -67,7 +67,8 @@ mesh_dir  = os.path.dirname(urdf_path)
 
 # 自动根据 URDF 判断是否是 fixed base 或 free-flyer
 robot = RobotWrapper.BuildFromURDF(urdf_path, mesh_dir)
-
+visualizer = MeshcatVisualizer(robot.model, robot.data, vis_dir="vis")
+visualizer.initViewer(open=True)
 model = robot.model
 data = model.createData()
 
@@ -77,11 +78,8 @@ print("nv:", model.nv)
 
 # create q
 q = pin.neutral(model)
-q = np.array([0, 0, 0, 0, 
-                0, 0, 0, 0, 
-                0, 0,0, 0, 
-                0, 0, 0, 0, 
-                1.64, 0, 1.63, 0])
+q = np.ones(20) * 0.5
+visualizer.display(q)
 print(q)
 # run fk
 pin.forwardKinematics(model, data, q)

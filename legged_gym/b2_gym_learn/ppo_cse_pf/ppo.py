@@ -9,11 +9,6 @@ from legged_gym.b2_gym_learn.ppo_cse_pf.actor_critic import ActorCritic
 from legged_gym.b2_gym_learn.ppo_cse_pf.rollout_storage import RolloutStorage
 
 
-class Adaptation_Args():
-    adaptation_module_learning_rate = 1.e-5
-    num_adaptation_module_substeps = 1
-    adaptation_batch_size = 64
-
 
 class PPO:
     actor_critic: ActorCritic
@@ -45,14 +40,10 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         
-        self.adaptation_labels = self.actor_critic.adaptation_labels
-        self.adaptation_dims = self.actor_critic.adaptation_dims
-        self.adaptation_weights = self.actor_critic.adaptation_weights
         
         self.storage = None # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
-        self.adaptation_module_optimizer = optim.Adam(self.actor_critic.parameters(),
-                                                      lr=Adaptation_Args.adaptation_module_learning_rate)
+
         self.transition = RolloutStorage.Transition()
 
         # PPO parameters
@@ -65,8 +56,8 @@ class PPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, obs_pred_shape, action_shape):
-        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, obs_pred_shape, action_shape, self.device)
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
+        self.storage = RolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
 
     def test_mode(self):
         self.actor_critic.test()
@@ -74,7 +65,7 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs, obs_pred):
+    def act(self, obs, critic_obs):
         # Compute the actions and values
         self.transition.actions = self.actor_critic.act(obs).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
@@ -84,7 +75,7 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
-        self.transition.observation_preds = obs_pred
+        # self.transition.observation_preds = obs_pred
         return self.transition.actions
     
     def process_env_step(self, rewards, dones, infos):
@@ -106,18 +97,9 @@ class PPO:
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
-        mean_adaptation_module_loss = 0
-        
-        mean_adaptation_losses = {}
-        label_start_end = {}
-        si = 0
-        for idx, (label, length) in enumerate(zip(self.adaptation_labels, self.adaptation_dims)):
-            label_start_end[label] = (si, si + length)
-            si = si + length
-            mean_adaptation_losses[label] = 0
         
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        for obs_batch, critic_obs_batch, obs_pred_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
+        for obs_batch, critic_obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch, masks_batch in generator:
 
 
@@ -175,38 +157,12 @@ class PPO:
                 data_size = critic_obs_batch.shape[0]
                 num_train = int(data_size // 5 * 4)
 
-                # Adaptation module gradient step, only update concurrent state estimation module, not policy network
-                if len(self.adaptation_labels) > 0:
-
-                    for epoch in range(Adaptation_Args.num_adaptation_module_substeps):
-
-                        adaptation_pred = self.actor_critic.get_student_latent(obs_batch)
-                        with torch.no_grad():
-                            adaptation_target = obs_pred_batch
-                        adaptation_loss = 0
-                        for idx, (label, length, weight) in enumerate(zip(self.adaptation_labels, self.adaptation_dims, self.adaptation_weights)):
-
-                            start, end = label_start_end[label]
-                            selection_indices = torch.linspace(start, end - 1, steps=end - start, dtype=torch.long)
-
-                            idx_adaptation_loss = F.mse_loss(adaptation_pred[:, selection_indices] * weight,
-                                                            adaptation_target[:, selection_indices] * weight)
-                            mean_adaptation_losses[label] += idx_adaptation_loss.item()
-
-                            adaptation_loss += idx_adaptation_loss
-
-                        self.adaptation_module_optimizer.zero_grad()
-                        adaptation_loss.backward()
-                        self.adaptation_module_optimizer.step()
-
-                        mean_adaptation_module_loss += adaptation_loss.item()
+                
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
-        mean_adaptation_module_loss /= (num_updates * Adaptation_Args.num_adaptation_module_substeps * Adaptation_Args.adaptation_batch_size)
-        for label in self.adaptation_labels:
-            mean_adaptation_losses[label] /= (num_updates * Adaptation_Args.num_adaptation_module_substeps * Adaptation_Args.adaptation_batch_size)
+       
         self.storage.clear()
-
-        return mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_adaptation_losses
+   
+        return mean_value_loss, mean_surrogate_loss

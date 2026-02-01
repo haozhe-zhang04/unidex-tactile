@@ -144,3 +144,4 @@ if it % 100 == 0:
 **为什么后期才振荡**：前期 policy 简单，kp 变化影响小；后期 policy 复杂，kp 变化导致 value prediction error 积累。
 
 
+

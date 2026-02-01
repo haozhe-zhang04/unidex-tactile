@@ -279,7 +279,7 @@ class WujiRobot_pos_force(BaseTask):
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
         self.num_pred_obs = self.cfg.env.num_pred_obs
         self.num_single_obs = self.cfg.env.num_single_obs
-        self.obs_pred = torch.zeros(self.num_envs, self.num_pred_obs, device=self.device, dtype=torch.float)
+        # self.obs_pred = torch.zeros(self.num_envs, self.num_pred_obs, device=self.device, dtype=torch.float)
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -319,8 +319,13 @@ class WujiRobot_pos_force(BaseTask):
 
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
 
-            if self.global_steps > self.cfg.commands.force_start_step * 24:
-                self._push_finger_tip(torch.arange(self.num_envs, device=self.device))  
+            if self.cfg.env.test:
+                # pass
+                self._push_finger_tip(torch.arange(self.num_envs, device=self.device)) 
+            else:
+                if self.global_steps > self.cfg.commands.force_start_step * 1:
+                    self._push_finger_tip(torch.arange(self.num_envs, device=self.device))
+       
             
 
             # DEBUG
@@ -336,26 +341,7 @@ class WujiRobot_pos_force(BaseTask):
                 raise Exception("Failed to apply external force to fingers")
             self.gym.simulate(self.sim)
             self.gym.refresh_dof_state_tensor(self.sim)
-        # for _ in range(self.cfg.control.decimation):
-        #     self.torques = self._compute_torques(self.actions)
-        #     self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
-        #     if self.cfg.env.test:
-        #         elapsed_time = self.gym.get_elapsed_time(self.sim)
-        #         sim_time = self.gym.get_sim_time(self.sim)
-        #         if sim_time-elapsed_time>0:
-        #             time.sleep(sim_time-elapsed_time)
-            
-        #     if self.device == 'cpu':
-        #         self.gym.fetch_results(self.sim, True)
 
-        #     if self.global_steps > self.cfg.commands.force_start_step * 24:
-        #         # push gripper
-                # self._push_gripper(torch.arange(self.num_envs, device=self.device))      
-        #         # push robot base 
-        #         # self._push_robot_base(torch.arange(self.num_envs, device=self.device)) 
-        #     self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.forces), None, gymapi.GLOBAL_SPACE)
-        #     self.gym.simulate(self.sim)
-        #     self.gym.refresh_dof_state_tensor(self.sim)
         self.post_physics_step()
 
         # return clipped obs, clipped states (None), rewards, dones and infos
@@ -369,11 +355,13 @@ class WujiRobot_pos_force(BaseTask):
                 print(f"Warning: obs_buf values near clip limit. Max abs: {obs_max_before_clip:.4f}, Mean abs: {obs_mean_before_clip:.4f}, Clip: {clip_obs}")
         
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
-        self.obs_pred = torch.clip(self.obs_pred, -clip_obs, clip_obs)
+        # self.obs_pred = torch.clip(self.obs_pred, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
         self.global_steps += 1
-        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf, 'obs_pred': self.obs_pred}, self.rew_buf, self.reset_buf, self.extras,self.reward_logs
+        if self.global_steps % 100 == 0:
+            print(f"Global steps: {self.global_steps}")
+        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf}, self.rew_buf, self.reset_buf, self.extras,self.reward_logs
 
 
     def post_physics_step(self):
@@ -394,7 +382,21 @@ class WujiRobot_pos_force(BaseTask):
 
 
         # update ee goal
-        self.update_curr_ee_goal()
+        if not self.cfg.env.test:
+            self.update_curr_ee_goal()
+        else:
+            self.commands[:, :, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = torch.tensor([[ 0.0105,  0.1226,  0.0649],
+        [-0.0141,  0.0431,  0.1953],
+        [-0.0231,  0.0075,  0.1927],
+        [-0.0194, -0.0236,  0.1872],
+        [-0.0120, -0.0556,  0.1754]])
+            self.commands[:,:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] =torch.tensor([[-5.3491e-01, -2.1001e-01, -2.8820e-01,  7.6597e-01],
+        [-5.8826e-02, -2.9283e-02, -1.1075e-01,  9.9167e-01],
+        [-6.8266e-06, -4.3619e-02,  1.5637e-04,  9.9905e-01],
+        [ 4.6107e-02, -4.0582e-02,  2.5266e-02,  9.9779e-01],
+        [ 9.9321e-02, -3.8312e-02,  8.2602e-02,  9.9088e-01]])
+            # self.update_curr_ee_goal()
+            # pass
 
 
         # compute observations, rewards, resets, ...
@@ -402,7 +404,8 @@ class WujiRobot_pos_force(BaseTask):
         self.compute_reward()
         env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
 
-        self.reset_idx(env_ids)
+        if not self.cfg.env.test:
+            self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
         self.last_last_actions[:] = torch.clone(self.last_actions[:])
@@ -622,7 +625,7 @@ class WujiRobot_pos_force(BaseTask):
         finger_tip_pos_base_normalized = self._normalize_pos(finger_tip_pos_base) # shape: (num_envs, num_fingers, 3)
         curr_finger_tip_goal_cart_base_normalized = self._normalize_pos(curr_finger_tip_goal_cart_base) # (num_envs, num_fingers, 3)
         pos_cmd_normalized = self._normalize_pos(commands[:,:,INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)]) # (num_envs, num_fingers*3)
-        
+
         self.privileged_obs_buf = torch.cat((
 
                                 self.dof_pos[:,:] * self.cfg.normalization.obs_scales.dof_pos,#20
@@ -657,23 +660,14 @@ class WujiRobot_pos_force(BaseTask):
                                 # FORCE_CMD 
                                 commands[:,:,INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.force_cmd,# 5*3=15
                             ),dim=-1) # 52
-        obs_pred = torch.cat((
-                                finger_tip_vel_base.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.finger_tip_vel  ,# 5*3=15
-                            ),dim=-1) #15
 
         obs_buf = torch.cat((   
                                 # 关节角度
                                 self.dof_pos[:,:] * self.cfg.normalization.obs_scales.dof_pos,#20
-                                # # 上一次动作
-                                # self.actions[:,:] * self.cfg.control.action_scale, # 20
                                 # 食指位置
                                 finger_tip_pos_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
                                 # 食指旋转 6d
                                 finger_tip_orn_6d_base.reshape(self.num_envs,-1), #5*6=30
-                                # 目标位置
-                                curr_finger_tip_goal_cart_base_normalized.reshape(self.num_envs,-1), # num_fingers*3 = 15
-                                # 位置误差
-                                finger_tip_pos_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.pose_error,# 5*3=15
                                 # 旋转误差 6d
                                 finger_tip_orn_6d_error.reshape(self.num_envs,-1) * self.cfg.normalization.obs_scales.orn_error,# 5*6=30
                                 # 传感器力
@@ -700,12 +694,11 @@ class WujiRobot_pos_force(BaseTask):
 
         obs_buf_all = torch.stack([self.obs_history[i]
                                    for i in range(self.obs_history.maxlen)], dim=1)  # N,T,K
-        self.obs_pred = obs_pred.clone()
         self.obs_buf = obs_buf_all.reshape(self.num_envs, -1)  # N, T*K
         self.privileged_obs_buf = torch.cat([self.critic_history[i] for i in range(self.cfg.env.c_frame_stack)], dim=1)
 
     def get_observations(self):
-        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf, 'obs_pred': self.obs_pred}
+        return {'obs': self.obs_buf, 'privileged_obs': self.privileged_obs_buf}
     
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -846,7 +839,7 @@ class WujiRobot_pos_force(BaseTask):
         forces_offset_base = self.transform_force_finger_tip_local_to_base(forces_offset_local)
 
         # 计算考虑力偏移的目标位置 shape: (num_envs, num_fingers, 3)
-        curr_finger_tip_goal_cart_base = forces_offset_base / (self.gripper_force_kps) + self.curr_finger_tip_goal_cart
+        curr_finger_tip_goal_cart_base = forces_offset_base / (self.gripper_force_kps) + self.commands[:,:, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)]
         curr_ee_goal_cart_world_offset = self.transform_pos_base_to_world(curr_finger_tip_goal_cart_base)
         curr_finger_tip_goal_cart_global = self.transform_pos_base_to_world(self.curr_finger_tip_goal_cart)
 
@@ -1333,7 +1326,7 @@ class WujiRobot_pos_force(BaseTask):
         
         # 最大 delta 变化量 (随着训练不断增大，最大到0.5，非线性增长，且越增越快)
         # 用指数型增长，早期增长慢、后期增长快
-        progress = torch.min(torch.tensor(self.global_steps) / 10000.0, torch.tensor(1.0))
+        progress = torch.min(torch.tensor(self.global_steps) / 1000.0, torch.tensor(1.0))
         max_delta = 0.1 + 0.4 * (1 - torch.exp(-5 * progress))  # 指数型：增长初期缓慢，后期加速，最大0.5
         
         # 为每个环境单独采样，直到找到无碰撞的配置
@@ -1343,16 +1336,22 @@ class WujiRobot_pos_force(BaseTask):
             if len(remaining_env_ids) == 0:
                 break
             
-            # 为剩余的环境生成 delta joint pos（每次改变不超过 0.2）
-            # 生成 [-max_delta, max_delta] 范围内的随机增量
-            delta_joint = torch_rand_float(
-                -max_delta, max_delta, 
-                (len(remaining_env_ids), self.num_dofs), 
-                device=self.device
-            )
-            
-            # 这样写不正确，torch.max(0.1, delta_joint) 会报错，应该用下面的方式将 delta_joint 逐元素和 0.1 比较
-            delta_joint = torch.clamp(delta_joint, min=0.1)
+            if not self.cfg.env.test:
+                # 为剩余的环境生成 delta joint pos（每次改变不超过 0.2）
+                # 生成 [-max_delta, max_delta] 范围内的随机增量
+                delta_joint = torch_rand_float(
+                    -max_delta, max_delta, 
+                    (len(remaining_env_ids), self.num_dofs), 
+                    device=self.device
+                )
+                # 保证 delta_joint 的绝对值最小为 0.1
+                delta_joint = torch.where(delta_joint.abs() < 0.1, 0.1 * delta_joint.sign(), delta_joint)
+            else:
+                delta_joint = torch_rand_float(
+                    -0.5, 0.5, 
+                    (len(remaining_env_ids), self.num_dofs), 
+                    device=self.device
+                )
 
             # 基于当前关节位置加上 delta
             new_joint = last_joint[remaining_env_ids, :] + delta_joint
@@ -1369,9 +1368,10 @@ class WujiRobot_pos_force(BaseTask):
             # 检查碰撞
             collision_mask = self._check_finger_self_collision(remaining_env_ids, min_distance=min_finger_distance)
             
-            # 找出仍然有碰撞的环境
-            colliding_env_ids = remaining_env_ids[~collision_mask]
-            
+            # # 找出仍然有碰撞的环境
+            # colliding_env_ids = remaining_env_ids[~collision_mask]
+            colliding_env_ids = torch.tensor([], device=self.device)
+
             # 找出无碰撞的环境（成功采样的环境）
             success_env_ids = remaining_env_ids[collision_mask]
             
@@ -2084,7 +2084,6 @@ class WujiRobot_pos_force(BaseTask):
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
-
         # pinocchio
         mesh_dir = os.path.dirname(asset_path)
         robot = RobotWrapper.BuildFromURDF(asset_path, mesh_dir)
@@ -2847,18 +2846,43 @@ class WujiRobot_pos_force(BaseTask):
 
    
     
+    # def _reward_action_smoothness(self):
+    #     """
+    #     Encourages smoothness in the robot's actions by penalizing large differences between consecutive actions.
+    #     This is important for achieving fluid motion and reducing mechanical stress.
+    #     """
+        
+    #     term_1 = torch.sum(torch.square(
+    #         self.last_actions - self.actions)[:, :], dim=1)
+    #     term_2 = torch.sum(torch.square(
+    #         self.actions + self.last_last_actions - 2 * self.last_actions)[:, :], dim=1)
+    #     term_3 = 0.05 * torch.sum(torch.abs(self.actions)[:, :], dim=1)
+    #     return term_1 + term_2 + term_3
+
     def _reward_action_smoothness(self):
         """
-        Encourages smoothness in the robot's actions by penalizing large differences between consecutive actions.
-        This is important for achieving fluid motion and reducing mechanical stress.
+        针对 Delta Action 预测优化的平滑性奖励
+        self.actions: 当前预测的 Delta a_t
+        self.last_actions: 上一时刻的 Delta a_{t-1}
+        self.last_last_actions: 上上时刻的 Delta a_{t-2}
         """
         
-        term_1 = torch.sum(torch.square(
-            self.last_actions - self.actions)[:, :], dim=1)
-        term_2 = torch.sum(torch.square(
-            self.actions + self.last_last_actions - 2 * self.last_actions)[:, :], dim=1)
-        term_3 = 0.05 * torch.sum(torch.abs(self.actions)[:, :], dim=1)
-        return term_1 + term_2 + term_3
+        # Term 1: 惩罚 Delta Action 的幅值 (限制瞬时速度)
+        # 如果这个值太大，机器人每一步动的位移就太大，容易震荡
+        term_1 = torch.sum(torch.square(self.actions), dim=1)
+        
+        # Term 2: 惩罚 Delta Action 的变化量 (限制加速度/抖动)
+        # 保证这一次的增量和上一次的增量接近，实现“匀加速”或“匀速”效果
+        term_2 = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+        
+        # Term 3: 惩罚二阶变化量 (可选，进一步拟合高阶平滑)
+        # 类似你原代码中的 term_2，但在 delta 空间这代表了控制增量的稳定性
+        term_3 = torch.sum(torch.square(self.actions - 2 * self.last_actions + self.last_last_actions), dim=1)
+
+        # 组合权重 (需要根据实际物理表现微调)
+        # 通常 term_2 的权重最为关键，用于消除“抖动”
+        reward = (0.5 * term_1 + 0.1 * term_2 + 0.1 * term_3)
+        return reward
     
     
     def _reward_ee_force_x(self):

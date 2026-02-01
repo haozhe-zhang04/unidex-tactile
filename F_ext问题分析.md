@@ -107,3 +107,4 @@ self.forces[env_ids_apply_push_step1[:, None], self.finger_tips_idx, :3] = \
 
 
 
+

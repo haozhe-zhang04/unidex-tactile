@@ -98,12 +98,12 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
 
 
     class env( WujiRobotCfg.env ):
-        num_envs = 4
+        num_envs = 2048
         num_actions = 20
         num_joints = 20
         frame_stack = 32
         c_frame_stack = 3
-        num_single_obs = 205 # 旋转误差从3维改为6维，增加了3维 
+        num_single_obs = 175 # 
 
         num_pred_obs = 15
         num_observations = int(frame_stack * num_single_obs)  # 32 * 22 = 704
@@ -151,7 +151,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
 
         settling_time_force_finger_tips_s = 1.0
 
-        force_start_step = 2000
+        force_start_step = 0
     class terrain:
         mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
         hf2mesh_method = "fast"  # grid or fast
@@ -265,7 +265,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             # feet_air_time = 1.0 
             # feet_height = 1.0 
             # ang_vel_xy = -0.02 
-            dof_acc = -2.5e-8
+            dof_acc = -2.5e-9
             dof_vel = -8.e-6
             # dof_acc_arm = -4.5e-7 
             # dof_vel_arm = -2.e-4
@@ -273,8 +273,8 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             # action_rate = -0.02 
             # action_rate_arm = -0.045 
 
-            # dof_pos_limits = -0.005
-            # dof_pos_limits = -0.05
+            dof_pos_limits = -0.005
+            dof_vel_limits = -0.005
             # torque_limits = -0.005
             # hip_pos = -0.5  
             # feet_drag = -0.0008 
@@ -288,16 +288,17 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             # tracking_ee_world = 2.0
 
             # tracking_ee_force_base = 0.5
-            tracking_ee_position_base_finger0 = 0.5
-            tracking_ee_position_base_finger1 = 0.5
-            tracking_ee_position_base_finger2 = 0.5
-            tracking_ee_position_base_finger3 = 0.5
-            tracking_ee_position_base_finger4 = 0.5
+            tracking_ee_position_base_finger0 = 0.1
+            tracking_ee_position_base_finger1 = 0.1
+            tracking_ee_position_base_finger2 = 0.1
+            tracking_ee_position_base_finger3 = 0.1
+            tracking_ee_position_base_finger4 = 0.1
 
-            tracking_ee_orientation_6d_base = 2.0
+            # tracking_ee_orientation_6d_base = 0.4
             
             # 多手指协调性奖励（可选，根据需要启用）
-            finger_tracking_consistency = 0.0  # 手指跟踪一致性奖励，默认关闭
+            # finger_tracking_consistency = 0.1  # 手指跟踪一致性奖励，默认关闭
+            action_smoothness = -0.001
 
             # tracking_ee_sphere_walking = 0.0  
             # tracking_ee_sphere_standing = 0.0

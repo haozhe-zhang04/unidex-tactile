@@ -7,7 +7,7 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
-
+from isaacgym import gymtorch, gymapi, gymutil
 import numpy as np
 import torch
 
@@ -64,17 +64,6 @@ def play(args):
         import copy
         path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
         os.makedirs(path, exist_ok=True)
-        adaptation_module_path = os.path.join(path, 'adaptation_module.pt')
-        model = copy.deepcopy(ppo_runner.alg.actor_critic.adaptation_encoder_module).to('cpu')
-        traced_script_module = torch.jit.script(model)
-        traced_script_module.save(adaptation_module_path)
-        print('Exported policy as jit script to: ', adaptation_module_path)
-
-        adaptation_decoder_path = os.path.join(path, 'adaptation_decoder.pt')
-        model = copy.deepcopy(ppo_runner.alg.actor_critic.adaptation_decoder_module).to('cpu')
-        traced_script_module = torch.jit.script(model)
-        traced_script_module.save(adaptation_decoder_path)
-        print('Exported policy as jit script to: ', adaptation_decoder_path)
 
         actor_body_path = os.path.join(path, 'actor_body.pt')
         model = copy.deepcopy(ppo_runner.alg.actor_critic.actor_body).to('cpu')
@@ -139,19 +128,22 @@ def play(args):
         line2_eepos, = ax_eepos.plot([0, vector2_eepos[0]], [0, vector2_eepos[1]], [0, vector2_eepos[2]], marker='o', label='eepos_gt')
         ax_eepos.legend()
     
-
+    
     env.play = True
     policy_info = {}
     for i in range(100*int(env.max_episode_length)):
         actions = policy(obs, policy_info)
         # breakpoint()
-        if FIX_COMMAND:
-            env.commands[:, INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] = 0.    # 1.0
-            env.commands[:, INDEX_TIP_TORQUE_X:INDEX_TIP_TORQUE_Z+1] = 0.
-            env.commands[:, INDEX_TIP_POS_X_CMD:INDEX_TIP_POS_Z_CMD+1] = 0.
-            env.commands[:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] = 0.
-            # env.gait_indices[:] = 0.
+        # if FIX_COMMAND:
+        #     env.commands[:,:, INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] = 0.    # 1.0
+        #     env.commands[:,:, INDEX_TIP_TORQUE_X:INDEX_TIP_TORQUE_Z+1] = 0.
+        #     env.commands[:,:, INDEX_TIP_POS_X_CMD:INDEX_TIP_POS_Z_CMD+1] = 0.
+        #     env.commands[:,:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] = torch.tensor([0,0,0,1], device=env.device)
+        #     # env.gait_indices[:] = 0.
         obs, rews, dones, infos,_= env.step(actions.detach())
+        import time
+        # time.sleep(0.5)
+
         # if VISUAL_PRED:
         #     ee_force_pred = policy_info["latents"][0, 6:9]
         #     vector1_ee_force = ee_force_pred
@@ -202,7 +194,7 @@ if __name__ == '__main__':
     EXPORT_POLICY = True
     RECORD_FRAMES = False
     MOVE_CAMERA = False
-    FIX_COMMAND = True
+    FIX_COMMAND = False
     VISUAL_PRED = True
     args = get_args()
     play(args)

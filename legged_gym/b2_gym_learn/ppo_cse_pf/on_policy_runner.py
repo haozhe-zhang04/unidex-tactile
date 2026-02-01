@@ -66,7 +66,6 @@ class OnPolicyRunner:
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
         actor_critic: ActorCritic = actor_critic_class( self.env.num_obs,
                                                         self.env.num_privileged_obs,
-                                                        self.env.num_pred_obs,
                                                         self.env.num_single_obs,
                                                         self.env.num_actions,
                                                         **self.policy_cfg).to(self.device)
@@ -76,7 +75,7 @@ class OnPolicyRunner:
         self.save_interval = self.cfg["save_interval"]
 
         # init storage and model
-        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs],[self.env.num_pred_obs], [self.env.num_actions])
+        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions])
 
         # Log
         self.log_dir = log_dir
@@ -101,9 +100,9 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
         
         obs_dict = self.env.get_observations()  # TODO: check, is this correct on the first step?
-        obs, privileged_obs, obs_pred = obs_dict["obs"], obs_dict["privileged_obs"], obs_dict["obs_pred"]
-        obs, privileged_obs, obs_pred = obs.to(self.device), privileged_obs.to(self.device), obs_pred.to(
-            self.device)
+        obs, privileged_obs = obs_dict["obs"], obs_dict["privileged_obs"]
+        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -114,19 +113,19 @@ class OnPolicyRunner:
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for it in range(self.current_learning_iteration, tot_iter):
+
             start = time.time()
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, privileged_obs, obs_pred)
-                    with torch.no_grad():
-                        latent = self.alg.actor_critic.get_student_latent(obs)
+                    actions = self.alg.act(obs, privileged_obs)
+                    # with torch.no_grad():
+                    #     latent = self.alg.actor_critic.get_student_latent(obs)
                     obs_dict, rewards, dones, infos,reward_logs = self.env.step(actions)
-                    obs, privileged_obs, obs_pred = obs_dict["obs"], obs_dict["privileged_obs"], obs_dict[
-                        "obs_pred"]
+                    obs, privileged_obs = obs_dict["obs"], obs_dict["privileged_obs"]
 
-                    obs, privileged_obs, obs_pred, rewards, dones = obs.to(self.device), privileged_obs.to(
-                        self.device), obs_pred.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    obs, privileged_obs, rewards, dones = obs.to(self.device), privileged_obs.to(
+                        self.device), rewards.to(self.device), dones.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
                     
                     if self.log_dir is not None:
@@ -148,7 +147,7 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(privileged_obs)
             
-            mean_value_loss, mean_surrogate_loss, mean_adaptation_module_loss, mean_adaptation_losses_dict = self.alg.update()
+            mean_value_loss, mean_surrogate_loss = self.alg.update()
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -189,7 +188,6 @@ class OnPolicyRunner:
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/mean_surrogate_loss', locs['mean_surrogate_loss'], locs['it'])
-        self.writer.add_scalar('Loss/mean_adaptation_module_loss', locs['mean_adaptation_module_loss'], locs['it'])
 
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
