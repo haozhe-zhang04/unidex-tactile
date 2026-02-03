@@ -217,7 +217,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         grasp_offset = 0.08
 
     class asset( WujiRobotCfg.asset ):
-        file = 'wujihand-urdf/urdf/right.urdf'
+        file = 'New_urdf/wujihand-urdf/urdf/right.urdf'
         name = "wuji"
         # foot_name = "foot"
         # thigh_name = "thigh"
