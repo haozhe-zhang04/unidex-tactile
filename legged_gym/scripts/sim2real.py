@@ -15,7 +15,8 @@ from b2_gym_learn.ppo_cse_pf.actor_critic import ActorCritic
 from b2_gym_learn.ppo_cse_pf.ppo import PPO
 import torch
 import torch.nn.functional as F
-
+import time
+from collections import deque
 
 def mat3x3_to_xyzw(R):
     """
@@ -168,8 +169,17 @@ class Sim2Real:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.config = config
         self.commands = torch.zeros((5, 13), device=self.device, dtype=torch.float32, requires_grad=False)
-
+        self.clip_actions = config["control"]["clip_actions"]
+        # 初始化观测历史堆叠（与仿真环境一致）
+        self.frame_stack = config["env"]["frame_stack"]
+        self.obs_history = deque(maxlen=self.frame_stack)
+        num_single_obs = config["env"]["num_single_obs"]
+        for _ in range(self.frame_stack):
+            self.obs_history.append(torch.zeros(num_single_obs, device=self.device, dtype=torch.float32))
+       
         self._init_policy()
+
+    # def _init_prop(self):
 
     def _init_policy(self):
         num_obs = self.config["env"]["num_obs"]
@@ -224,7 +234,7 @@ class Sim2Real:
     def get_joint_pose(self):
         return self.hand.get_pose()
 
-    def get_certain_finger_tip_pos(self, joint_pos):
+    def set_cmd(self, joint_pos):
         assert joint_pos.shape == (20,)
         pin.forwardKinematics(self.pinocchio_model, self.pinocchio_data, joint_pos)
         pin.updateFramePlacements(self.pinocchio_model, self.pinocchio_data)
@@ -236,8 +246,7 @@ class Sim2Real:
             quat = mat3x3_to_xyzw(torch.from_numpy(orn).to(self.device, dtype=torch.float32))
             self.commands[finger_idx, INDEX_TIP_POS_X_CMD:INDEX_TIP_POS_Z_CMD+1] = torch.from_numpy(pos).to(self.device, dtype=torch.float32)
             self.commands[finger_idx, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] = quat
-        print("commands:",self.commands[:,INDEX_TIP_POS_X_CMD:INDEX_TIP_POS_Z_CMD+1])
-        print("quat",self.commands[:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1])
+
 
     def get_current_finger_tip_pos(self):
         """
@@ -262,6 +271,20 @@ class Sim2Real:
             tip_orn[finger_idx] = tip_goal_orn_base
         return tip_pos, tip_orn
     
+    def get_certain_finger_tip_pos(self, joint_pos):
+        assert joint_pos.shape == (20,)
+        pin.forwardKinematics(self.pinocchio_model, self.pinocchio_data, joint_pos)
+        pin.updateFramePlacements(self.pinocchio_model, self.pinocchio_data)
+        tip_pos = torch.zeros(5, 3, device=self.device)
+        tip_orn = torch.zeros(5, 4, device=self.device)
+        for finger_idx in range(len(self.pinocchio_tips_idx)):
+            pinocchio_tip_frame_idx = self.pinocchio_tips_idx[finger_idx]
+            pos = self.pinocchio_data.oMf[pinocchio_tip_frame_idx].translation
+            orn = self.pinocchio_data.oMf[pinocchio_tip_frame_idx].rotation
+            tip_pos[finger_idx] = torch.from_numpy(pos).to(self.device, dtype=torch.float32)
+            tip_orn[finger_idx] = mat3x3_to_xyzw(torch.from_numpy(orn).to(self.device, dtype=torch.float32))
+        return tip_pos, tip_orn
+
     
     def get_obs(self):
         dof_pos = torch.from_numpy(self.get_joint_pose()).to(self.device, dtype=torch.float32)
@@ -277,25 +300,35 @@ class Sim2Real:
         
         pos_cmd_normalized = self._normalize_pos(self.commands[:, INDEX_TIP_POS_X_CMD:INDEX_TIP_POS_Z_CMD+1])
       
-       
-        obs = torch.cat([dof_pos* self.config["obs_scales"]["dof_pos"], 
-                    finger_tip_pos_normalized.flatten(), 
-                    finger_tip_orn_6d_base.flatten(), 
-                    finger_tip_orn_6d_error.flatten() * self.config["obs_scales"]["orn_error"],
-                    forces_base.flatten() * self.config["obs_scales"]["sensor_force"],
-                    forces_error.flatten() * self.config["obs_scales"]["force_error"],
-                    pos_cmd_normalized.flatten(),
-                    self.commands[:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1].flatten() * self.config["obs_scales"]["orientation_cmd"],
-                    self.commands[:, INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].flatten() * self.config["obs_scales"]["force_cmd"]], dim=-1)
-        obs_full = {"obs":obs.unsqueeze(0)}
+        # 构造单帧观测（与仿真环境obs_buf顺序一致）
+        obs_single = torch.cat([dof_pos* self.config["obs_scales"]["dof_pos"], #20
+                    finger_tip_pos_normalized.flatten(), #15
+                    finger_tip_orn_6d_base.flatten(), #30
+                    finger_tip_orn_6d_error.flatten() * self.config["obs_scales"]["orn_error"],#30
+                    forces_base.flatten() * self.config["obs_scales"]["sensor_force"],#15
+                    forces_error.flatten() * self.config["obs_scales"]["force_error"],#15
+                    pos_cmd_normalized.flatten(), #15
+                    self.commands[:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1].flatten() * self.config["obs_scales"]["orientation_cmd"],#20
+                    self.commands[:, INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1].flatten() * self.config["obs_scales"]["force_cmd"]], dim=-1) #15
+        
+        # 添加到历史队列（与仿真环境一致）
+        self.obs_history.append(obs_single)
+        
+        # 堆叠历史观测（frame_stack帧）
+        obs_stacked = torch.stack([self.obs_history[i] for i in range(self.obs_history.maxlen)], dim=0)  # (frame_stack, num_single_obs)
+        obs_flat = obs_stacked.flatten()  # (frame_stack * num_single_obs,)
+        
+        obs_full = {"obs": obs_flat.unsqueeze(0)}  # (1, frame_stack * num_single_obs)
         return obs_full
 
     def get_action(self, obs):
         return self.policy(obs)
 
+    def update_commands_randomly(self):
+        joint_pos = torch.rand
 
 def main():
-    urdf_path = "/home/hz01/haozhe_workspace/UniFP/wujihand-urdf/urdf/right.urdf"
+    urdf_path = "wujihand-urdf/urdf/right.urdf"
     mesh_dir = os.path.dirname(urdf_path)
     task = "wuji_pos_force"
     config = {
@@ -304,6 +337,7 @@ def main():
             "num_privileged_obs": 3*240,
             "num_single_obs": 175,
             "num_actions": 20,
+            "frame_stack": 32,
         },
         "policy": {
             "activation": "elu",
@@ -312,7 +346,12 @@ def main():
             "critic_hidden_dims": [512, 256, 128],
         },
         "model": {
-            "model_state_dict": "/home/hz01/haozhe_workspace/UniFP/logs/wuji_pos_force/Dec27_20-20-03_/model_400.pt"
+            "model_state_dict": "/home/hz/hz_workspace/unidex-tactile/logs/wuji_pos_force/Jan30_21-04-38_/model_14000.pt"
+        },
+        "control":{
+            "action_scale": 0.1,
+            "decimation": 4,
+            "clip_actions": 1.0
         },
         "obs_scales":{
             "dof_pos": 1.0,
@@ -334,23 +373,37 @@ def main():
     sim2real = Sim2Real(urdf_path=urdf_path, mesh_dir=mesh_dir, task = task, config = config)
     sim2real.set_pose(np.zeros(20))
 
-    sim2real.get_certain_finger_tip_pos(np.zeros(20))
-    import time
+    sim2real.set_cmd(np.ones(20)*0.3)
+    time.sleep(1.5)
+
     while True:
+        # 获取观测
         obs = sim2real.get_obs()
-        np.save("./real_obs",obs)
-        print("real_obs:",obs)
-        action = sim2real.get_action(obs)
         
-        action_np = action.detach().cpu().numpy()
-        np.save("./real_action",action_np)
-        print("real_action",action_np)
-        break
-        curr_action = sim2real.get_joint_pose()
-        new_action = curr_action + action_np
-        print(new_action)
-        sim2real.set_pose(new_action.squeeze(0))
-        time.sleep(0.1)
+        # 获取action（与仿真环境一致，每decimation步调用一次policy）
+        action = sim2real.get_action(obs)
+        # action = torch.clip(action, sim2real.clip_actions, sim2real.clip_actions)
+        action_np = action.detach().cpu().numpy().squeeze(0)  # (20,)
+        # print(action_np)
+        
+        # decimation: 同一个action重复使用多次（与仿真环境一致）
+        # for _ in range(sim2real.config["control"]["decimation"]):
+        curr_dof_pos = sim2real.get_joint_pose()
+        
+        # 修复：动作应用公式与仿真环境一致
+        # target = action * action_scale + current_pos
+        new_dof_pos = action_np * sim2real.config["control"]["action_scale"] + curr_dof_pos
+        # new_dof_pos = torch.clamp(
+        #     new_dof_pos,
+        #     self.dof_pos_limits[:,0],  # lower limits
+        #     self.dof_pos_limits[:,1],   # upper limits
+        # )      
+        sim2real.set_pose(new_dof_pos)
+        
+        # 更新观测（每个decimation步都更新obs_history，与仿真保持同步）
+        obs = sim2real.get_obs()
+            
+        # time.sleep(0.1)
 
 if __name__ == "__main__":
     main()

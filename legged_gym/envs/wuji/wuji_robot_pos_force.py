@@ -320,13 +320,12 @@ class WujiRobot_pos_force(BaseTask):
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
 
             if self.cfg.env.test:
-                # pass
-                self._push_finger_tip(torch.arange(self.num_envs, device=self.device)) 
+                pass
+                # self._push_finger_tip(torch.arange(self.num_envs, device=self.device)) 
             else:
                 if self.global_steps > self.cfg.commands.force_start_step * 1:
                     self._push_finger_tip(torch.arange(self.num_envs, device=self.device))
        
-            
 
             # DEBUG
             # 实时记录 self.forces[0,1,0:3] 的值

@@ -70,6 +70,7 @@ def main():
                     0.0, 0.0, 0.0, 0.0, 
                     0.0, 0.0, 0.0, 0.0, 
                     0.0, 0.0, 0.0, 0.0])
+    # pose = np.ones(20)*0.2
 
     right_hand.set_all_joints_pos(pose)
 

@@ -132,7 +132,11 @@ def play(args):
     env.play = True
     policy_info = {}
     for i in range(100*int(env.max_episode_length)):
+        print("commands:", env.commands)
+        print("obs:", obs['obs'])
+
         actions = policy(obs, policy_info)
+        
         # breakpoint()
         # if FIX_COMMAND:
         #     env.commands[:,:, INDEX_TIP_FORCE_X:INDEX_TIP_FORCE_Z+1] = 0.    # 1.0
@@ -141,7 +145,7 @@ def play(args):
         #     env.commands[:,:, INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] = torch.tensor([0,0,0,1], device=env.device)
         #     # env.gait_indices[:] = 0.
         obs, rews, dones, infos,_= env.step(actions.detach())
-        import time
+        
         # time.sleep(0.5)
 
         # if VISUAL_PRED:

@@ -105,8 +105,7 @@ class TaskRegistry():
     def make_alg_runner(self, env, name=None, args=None, train_cfg=None, log_root="default") -> Tuple[OnPolicyRunner, LeggedRobotCfgPPO]:
         """ Creates the training algorithm  either from a registered namme or from the provided config file.
 
-        Args:
-            env (isaacgym.VecTaskPython): The environment to train (TODO: remove from within the algorithm)
+        Args:train_cfgse algorithm)
             name (string, optional): Name of a registered env. If None, the config file will be used instead. Defaults to None.
             args (Args, optional): Isaac Gym comand line arguments. If None get_args() will be called. Defaults to None.
             train_cfg (Dict, optional): Training config file. If None 'name' will be used to get the config file. Defaults to None.

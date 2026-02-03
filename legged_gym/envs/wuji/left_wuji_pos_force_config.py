@@ -1,7 +1,7 @@
 from legged_gym.envs.base.wuji import WujiRobotCfg, WujiRobotCfgPPO
 import numpy as np
 
-class WujiPosForceRoughCfg( WujiRobotCfg ):
+class LeftWujiPosForceRoughCfg( WujiRobotCfg ):
 
     class goal_ee:
         num_commands = 9
@@ -98,7 +98,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
 
 
     class env( WujiRobotCfg.env ):
-        num_envs = 2048
+        num_envs = 32
         num_actions = 20
         num_joints = 20
         frame_stack = 32
@@ -217,7 +217,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         grasp_offset = 0.08
 
     class asset( WujiRobotCfg.asset ):
-        file = 'wujihand-urdf/urdf/right.urdf'
+        file = 'wujihand-urdf/urdf/left.urdf'
         name = "wuji"
         # foot_name = "foot"
         # thigh_name = "thigh"
@@ -308,7 +308,7 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
             # tracking_ee_orn = 0.
             # tracking_ee_orn_ry = 0.
 
-class WujiPosForceRoughCfgPPO( WujiRobotCfgPPO ):
+class LeftWujiPosForceRoughCfgPPO( WujiRobotCfgPPO ):
     class algorithm( WujiRobotCfgPPO.algorithm ):
         entropy_coef = 0.001
     class policy:
