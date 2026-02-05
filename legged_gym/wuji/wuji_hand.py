@@ -65,17 +65,19 @@ def main():
     # left_hand = wuji_node(serial_number="3375387C3233", is_use_csp=False)
     # left_hand.set_all_joints_pos(np.zeros(20,))
     right_hand = wuji_node(serial_number="337238723233", is_use_csp=False)
-    pose = np.array([0.0, 0.0, 0.0, 0.0, 
-                    0.0, 0.0, 0.0, 0.0, 
-                    0.0, 0.0, 0.0, 0.0, 
-                    0.0, 0.0, 0.0, 0.0, 
-                    0.0, 0.0, 0.0, 0.0])
-    # pose = np.ones(20)*0.2
+    # right_hand = wuji_node(serial_number="337238853233", is_use_csp=False)
+    # pose = np.array([0.0, 0.0, 0.0, 0.0, 
+    #                 0.0, 0.0, 0.0, 0.0, 
+    #                 0.0, 0.0, 0.0, 0.0, 
+    #                 0.0, 0.0, 0.0, 0.0, 
+    #                 0.0, 0.0, 0.0, 0.0])
+    pose = np.ones(20)*0.5
+    # pose = np.zeros(20)
 
     right_hand.set_all_joints_pos(pose)
 
     import time
-    time.sleep(0.5)
+    time.sleep(1.0)
 
  
 

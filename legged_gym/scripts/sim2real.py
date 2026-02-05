@@ -153,7 +153,7 @@ INDEX_TIP_ORIENTATION_W_CMD = 12
 class Sim2Real:
 
     def __init__(self,urdf_path,mesh_dir,task,config):
-        self.hand = wuji_node(serial_number="337238723233", is_use_csp=False)
+        self.hand = wuji_node(serial_number="337238853233", is_use_csp=False)
         robot = RobotWrapper.BuildFromURDF(urdf_path, mesh_dir)
 
         self.pinocchio_model = robot.model
@@ -328,7 +328,7 @@ class Sim2Real:
         joint_pos = torch.rand
 
 def main():
-    urdf_path = "wujihand-urdf/urdf/right.urdf"
+    urdf_path = "wujihand-urdf/urdf/left.urdf"
     mesh_dir = os.path.dirname(urdf_path)
     task = "wuji_pos_force"
     config = {
@@ -346,7 +346,7 @@ def main():
             "critic_hidden_dims": [512, 256, 128],
         },
         "model": {
-            "model_state_dict": "/home/hz/hz_workspace/unidex-tactile/logs/wuji_pos_force/Jan30_21-04-38_/model_14000.pt"
+            "model_state_dict": "/home/hz/hz_workspace/unidex-tactile/logs/wuji_pos_force/Feb04_13-58-28_/model_4200.pt"
         },
         "control":{
             "action_scale": 0.1,
@@ -373,7 +373,7 @@ def main():
     sim2real = Sim2Real(urdf_path=urdf_path, mesh_dir=mesh_dir, task = task, config = config)
     sim2real.set_pose(np.zeros(20))
 
-    sim2real.set_cmd(np.ones(20)*0.3)
+    sim2real.set_cmd(np.ones(20)*0.5)
     time.sleep(1.5)
 
     while True:

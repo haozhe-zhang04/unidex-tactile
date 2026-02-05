@@ -226,6 +226,28 @@ class WujiPosForceRoughCfg( WujiRobotCfg ):
         terminate_after_contacts_on = []
         self_collisions = 1 # 1 to disable, 0 to enable...bitwise filter
         fix_base_link = True
+    class normalization:
+        class obs_scales:
+            dof_pos = 1.0
+            dof_vel = 0.05
+            finger_tip_pos_x_min = [0.01051468, -0.01408456,-0.02309369, -0.01941702,-0.01198453]      
+            finger_tip_pos_x_max = [0.08438421, 0.096,      0.09327604 , 0.09595964, 0.10003495]
+            finger_tip_pos_y_min = [-0.04537681,-0.03664682,-0.03951727, -0.06925806, -0.09866672]
+            finger_tip_pos_y_max = [0.12591782, 0.05499584, 0.05443658, 0.02417522,-0.00785031]
+            finger_tip_pos_z_min = [0.05079299, 0.03804432, 0.03675804, 0.03169484, 0.02277947]
+            finger_tip_pos_z_max = [0.13120497, 0.19527645, 0.19265326, 0.1871634, 0.1754161]
+            sensor_force = 0.1
+            pose_error = 5.0
+            orn_error = 2.0
+            force_error = 0.1
+
+            force_cmd = 0.1
+            orientation_cmd = 1.0
+
+            finger_tip_vel = 5.0
+        
+        clip_observations = 1.0
+        clip_actions = 1.0
     
     #TODO
     class rewards( WujiRobotCfg.rewards ):

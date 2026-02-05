@@ -62,25 +62,30 @@ def mat3x3_to_quat(R):
     quat = quat / quat.norm(dim=-1, keepdim=True)  # normalize
     return quat
 
-urdf_path = "wujihand-urdf/urdf/right.urdf"
+urdf_path = "New_urdf/wujihand-urdf/urdf/left.urdf"
 mesh_dir  = os.path.dirname(urdf_path)
 
 # 自动根据 URDF 判断是否是 fixed base 或 free-flyer
 robot = RobotWrapper.BuildFromURDF(urdf_path, mesh_dir)
-visualizer = MeshcatVisualizer(robot.model, robot.data, vis_dir="vis")
-visualizer.initViewer(open=True)
+# visualizer = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
+# visualizer.initViewer(open=True)
+# visualizer.loadViewerModel() # 这一步很重要，用于加载模型到网页
 model = robot.model
 data = model.createData()
 
-# Show DOFs
-print("nq:", model.nq)
-print("nv:", model.nv)
+# # Show DOFs
+# print("nq:", model.nq)
+# print("nv:", model.nv)
 
-# create q
-q = pin.neutral(model)
-q = np.ones(20) * 0.5
-visualizer.display(q)
-print(q)
+# # create q
+# q = pin.neutral(model)
+q = np.array([0,0,0,0,
+                0,0,0,0,
+                0,0,0,0,
+                0,0,0,0,
+                1.64,0,1.63,0])
+# visualizer.display(q)
+# print(q)
 # run fk
 pin.forwardKinematics(model, data, q)
 pin.updateFramePlacements(model, data)
@@ -99,4 +104,4 @@ for name in tip_names:
     pos = data.oMf[fid].translation
     orn = data.oMf[fid].rotation
     print(name, pos)
-    print(orn)
+    # print(orn)
