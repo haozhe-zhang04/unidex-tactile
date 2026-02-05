@@ -320,8 +320,8 @@ class WujiRobot_pos_force(BaseTask):
             self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_pos_target))
 
             if self.cfg.env.test:
-                pass
-                # self._push_finger_tip(torch.arange(self.num_envs, device=self.device)) 
+                # pass
+                self._push_finger_tip(torch.arange(self.num_envs, device=self.device)) 
             else:
                 if self.global_steps > self.cfg.commands.force_start_step * 1:
                     self._push_finger_tip(torch.arange(self.num_envs, device=self.device))
@@ -384,17 +384,17 @@ class WujiRobot_pos_force(BaseTask):
         if not self.cfg.env.test:
             self.update_curr_ee_goal()
         else:
-            self.commands[:, :, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = torch.tensor([[ 0.0105,  0.1226,  0.0649],
-        [-0.0141,  0.0431,  0.1953],
-        [-0.0231,  0.0075,  0.1927],
-        [-0.0194, -0.0236,  0.1872],
-        [-0.0120, -0.0556,  0.1754]])
-            self.commands[:,:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] =torch.tensor([[-5.3491e-01, -2.1001e-01, -2.8820e-01,  7.6597e-01],
-        [-5.8826e-02, -2.9283e-02, -1.1075e-01,  9.9167e-01],
-        [-6.8266e-06, -4.3619e-02,  1.5637e-04,  9.9905e-01],
-        [ 4.6107e-02, -4.0582e-02,  2.5266e-02,  9.9779e-01],
-        [ 9.9321e-02, -3.8312e-02,  8.2602e-02,  9.9088e-01]])
-            # self.update_curr_ee_goal()
+        #     self.commands[:, :, INDEX_TIP_POS_X_CMD:(INDEX_TIP_POS_Z_CMD+1)] = torch.tensor([[ 0.0105,  0.1226,  0.0649],
+        # [-0.0141,  0.0431,  0.1953],
+        # [-0.0231,  0.0075,  0.1927],
+        # [-0.0194, -0.0236,  0.1872],
+        # [-0.0120, -0.0556,  0.1754]])
+        #     self.commands[:,:,INDEX_TIP_ORIENTATION_X_CMD:INDEX_TIP_ORIENTATION_W_CMD+1] =torch.tensor([[-5.3491e-01, -2.1001e-01, -2.8820e-01,  7.6597e-01],
+        # [-5.8826e-02, -2.9283e-02, -1.1075e-01,  9.9167e-01],
+        # [-6.8266e-06, -4.3619e-02,  1.5637e-04,  9.9905e-01],
+        # [ 4.6107e-02, -4.0582e-02,  2.5266e-02,  9.9779e-01],
+        # [ 9.9321e-02, -3.8312e-02,  8.2602e-02,  9.9088e-01]])
+            self.update_curr_ee_goal()
             # pass
 
 
